@@ -1,0 +1,8 @@
+{
+  "name": "nt-mcp-server",
+  "version": "0.1.0",
+  "description": "MCP server for NinjaTrader 8 — zero deps, stdio transport",
+  "main": "nt-mcp-server.js",
+  "type": "module",
+  "engines": { "node": ">=18" }
+}
