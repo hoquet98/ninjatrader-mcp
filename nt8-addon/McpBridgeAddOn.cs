@@ -1,6 +1,6 @@
-// McpBridgeAddOn.cs — NinjaTrader 8 AddOn, HTTP API на порту 7890
-// Компилировать в NT8: File → Utilities → NinjaScript Editor → правой кнопкой → Compile
-// Или: скопировать в Documents\NinjaTrader 8\bin\Custom\AddOns\
+// McpBridgeAddOn.cs — NinjaTrader 8 AddOn, HTTP API on port 7890
+// Compile in NT8: File → Utilities → NinjaScript Editor → right-click → Compile
+// Or: copy to Documents\NinjaTrader 8\bin\Custom\AddOns\
 
 #region Using declarations
 using System;
@@ -38,7 +38,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             _serverThread.IsBackground = true;
             _serverThread.Start();
 
-            Log("McpBridgeAddOn запущен на http://localhost:7890", LogLevel.Information);
+            Log("McpBridgeAddOn started on http://localhost:7890", LogLevel.Information);
         }
 
         protected override void OnShutDown()
@@ -46,7 +46,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             _running = false;
             _listener?.Stop();
             _listener?.Close();
-            Log("McpBridgeAddOn остановлен", LogLevel.Information);
+            Log("McpBridgeAddOn stopped", LogLevel.Information);
         }
 
         private void HandleRequests()
@@ -61,7 +61,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 catch (HttpListenerException) { break; }
                 catch (Exception ex)
                 {
-                    Log($"Ошибка: {ex.Message}", LogLevel.Error);
+                    Log($"Error: {ex.Message}", LogLevel.Error);
                 }
             }
         }
@@ -285,7 +285,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             var instrument = Instrument.GetInstrument(symbol);
             if (instrument == null) return new { error = $"instrument not found: {symbol}" };
 
-            // Пробуем взять из MarketData
+            // Try to get it from MarketData
             try
             {
                 var md = MarketData.GetMarketData(instrument);
@@ -366,7 +366,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         // ─── Start Strategy ─────────────────────────────────────────────
         private object StartStrategy(string body)
         {
-            // Заглушка — для Phase 2
+            // Stub — for Phase 2
             var req = JsonConvert.DeserializeObject<Dictionary<string, object>>(body);
             return new
             {
