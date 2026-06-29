@@ -31,14 +31,22 @@ namespace NinjaTrader.NinjaScript.AddOns
         {
             _running = true;
             _listener = new HttpListener();
-            _listener.Prefixes.Add("http://localhost:7890/");
+
+            // Bind address is configurable via the NT8_MCP_PREFIX environment variable.
+            // Default: localhost only (safe — same-machine access).
+            // For remote access over a PRIVATE network (e.g. Tailscale), set it to
+            // "http://+:7890/" so the AddOn also listens on the VPN interface.
+            // NEVER expose this on a public interface without auth + firewall.
+            var prefix = Environment.GetEnvironmentVariable("NT8_MCP_PREFIX");
+            if (string.IsNullOrEmpty(prefix)) prefix = "http://localhost:7890/";
+            _listener.Prefixes.Add(prefix);
             _listener.Start();
 
             _serverThread = new Thread(HandleRequests);
             _serverThread.IsBackground = true;
             _serverThread.Start();
 
-            Log("McpBridgeAddOn started on http://localhost:7890", LogLevel.Information);
+            Log($"McpBridgeAddOn started on {prefix}", LogLevel.Information);
         }
 
         protected override void OnShutDown()
