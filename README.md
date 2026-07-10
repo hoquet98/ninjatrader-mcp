@@ -72,7 +72,9 @@ mcpServers:
     transport: stdio
 ```
 
-## Tools (Phase 1)
+## Tools
+
+### Phase 1 — account, trading, data
 
 | Tool | Description |
 |------|-------------|
@@ -88,6 +90,26 @@ mcpServers:
 | `nt_search` | Search instruments by name or symbol |
 | `nt_execute_strategy` | Launch a NinjaScript strategy on a chart |
 
+### Phase 2 — strategy authoring, compile, backtest
+
+| Tool | Description |
+|------|-------------|
+| `nt_list_strategies` | List NinjaScript strategy files in `bin\Custom\Strategies` |
+| `nt_strategy_source` | Read one strategy's NinjaScript source |
+| `nt_create_strategy` | Write full NinjaScript source into `bin\Custom\Strategies` |
+| `nt_compile` | Recompile NinjaScript in-process (Roslyn, hot-swap, **no NT8 restart**); returns compile errors |
+| `nt_backtest` | Run a backtest via the Strategy Analyzer over a configurable **symbol, date range (`from`/`to`), timeframe (`period`/`periodValue`), and `params`**; returns net P&L, drawdown, gross P/L, trade count + trade list |
+
+**Typical Phase 2 flow:** `nt_create_strategy` (agent writes the NinjaScript) → `nt_compile` (build + hot-load, reports any errors) → `nt_backtest` (run it, read metrics) → iterate.
+
+Example `nt_backtest` — the same strategy over a specific symbol, date range, timeframe, and parameters:
+```jsonc
+{ "strategy": "MyStrategy", "symbol": "GC 08-26",
+  "from": "2026-03-01", "to": "2026-04-30",
+  "period": "Minute", "periodValue": 5,
+  "params": { "Fast": 5, "Slow": 50 }, "maxTrades": 50 }
+```
+
 ## Configuration
 
 Environment variables:
@@ -97,12 +119,19 @@ Environment variables:
 | `NT8_HOST` | `127.0.0.1` | NT8 AddOn hostname |
 | `NT8_PORT` | `7890` | NT8 AddOn HTTP port |
 
-## Roadmap (Phase 2)
+## How Phase 2 works
 
-- `nt_backtest` — run Strategy Analyzer, return full trade list + performance metrics
-- `nt_compile` — compile NinjaScript source in memory (incremental, no disk write)
-- `nt_chart_state` — read chart state (symbol, timeframe, indicators)
-- `nt_indicator_values` — pull live indicator values from open charts
+The AddOn calls NinjaTrader's own internal Roslyn compiler (`NinjaTrader.Code.Compiler`) via
+reflection, then lets NT8 hot-swap the NinjaScript AppDomain — the same thing pressing **F5** does,
+but triggered over HTTP with **no restart**. Backtests are run by driving a bridge-managed
+**Strategy Analyzer** window and reading its `SystemPerformance` (the same engine and numbers you get
+from the GUI). A successful compile briefly drops the HTTP connection as the AppDomain reloads; the
+result is written to a durable file and `nt_compile` reads it back automatically.
+
+## Roadmap (Phase 3)
+
+- `nt_optimize` — parameter optimization via the Strategy Analyzer optimizer
+- `nt_chart_state` / `nt_indicator_values` — read chart state + live indicator values
 - `nt_deploy_strategy` — deploy, verify, and monitor a strategy in production
 - Full backtest → optimize → deploy → monitor pipeline
 
@@ -116,6 +145,10 @@ Environment variables:
 
 MIT — do what you want, no strings attached. See [LICENSE](LICENSE).
 
-## Author
+## Based on work from Original Author
 
 Built by [Igor](https://github.com/Wendigooor) and his AI agent Hermes.
+
+## Updated capabilities Authored By:
+
+Quant Trading Pro: (https://www.quanttradingpro.com/)

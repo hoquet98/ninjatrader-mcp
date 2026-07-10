@@ -126,10 +126,66 @@ const TOOLS = [
       required: ['strategyName', 'symbol'],
     },
   },
+
+  // ─── Phase 2: strategy authoring / compile / backtest ─────────────────
+  {
+    name: 'nt_list_strategies',
+    description: 'List NinjaScript strategy source files in bin\\Custom\\Strategies (name, size, last modified)',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'nt_strategy_source',
+    description: 'Read the NinjaScript source of one strategy by class/file name',
+    inputSchema: {
+      type: 'object',
+      properties: { name: { type: 'string', description: 'Strategy class/file name (no .cs)' } },
+      required: ['name'],
+    },
+  },
+  {
+    name: 'nt_create_strategy',
+    description: 'Write a NinjaScript strategy (.cs) into bin\\Custom\\Strategies. Pass full NinjaScript C# source. Call nt_compile afterward to build + hot-load it.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name:      { type: 'string', description: 'Strategy class/file name (no .cs). Must match the class name in source.' },
+        source:    { type: 'string', description: 'Full NinjaScript C# source (namespace NinjaTrader.NinjaScript.Strategies, class : Strategy)' },
+        overwrite: { type: 'boolean', description: 'Overwrite if it already exists', default: true },
+      },
+      required: ['name', 'source'],
+    },
+  },
+  {
+    name: 'nt_compile',
+    description: 'Recompile all NinjaScript in-process (Roslyn, hot-swap, no NT8 restart). Returns success + any compile errors/warnings. Run after nt_create_strategy.',
+    inputSchema: {
+      type: 'object',
+      properties: { debug: { type: 'boolean', description: 'Emit a debug build', default: false } },
+    },
+  },
+  {
+    name: 'nt_backtest',
+    description: 'Run a backtest of a compiled strategy via the NT8 Strategy Analyzer over a configurable symbol, date range, timeframe, and parameters. Returns performance metrics (net P&L, drawdown, gross P/L, trade count) + a capped trade list.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        strategy:    { type: 'string', description: 'Strategy class name (must be compiled first)' },
+        symbol:      { type: 'string', description: 'Instrument (e.g. GC 08-26, NQ, ES)' },
+        from:        { type: 'string', description: 'Start date YYYY-MM-DD (defaults to the Strategy Analyzer range if omitted)' },
+        to:          { type: 'string', description: 'End date YYYY-MM-DD (defaults to the Strategy Analyzer range if omitted)' },
+        period:      { type: 'string', enum: ['Minute', 'Day', 'Tick', 'Second', 'Range', 'Volume'], description: 'Bars period type', default: 'Minute' },
+        periodValue: { type: 'number', description: 'Bars period value (e.g. 5 for 5m)', default: 1 },
+        params:      { type: 'object', description: 'Strategy parameter overrides { paramName: value }' },
+        maxTrades:   { type: 'number', description: 'Max trades to include in the response (metrics always full)', default: 50 },
+        timeoutSec:  { type: 'number', description: 'Server-side wait for the run to finish', default: 180 },
+      },
+      required: ['strategy', 'symbol'],
+    },
+  },
 ];
 
 // ─── HTTP Client to NT8 AddOn ──────────────────────────────────────────
-function ntFetch(endpoint, method = 'GET', body = null) {
+function ntFetch(endpoint, method = 'GET', body = null, timeoutMs = 10000) {
   return new Promise((resolve, reject) => {
     const url = new URL(endpoint, NT8_BASE);
     const options = {
@@ -138,7 +194,7 @@ function ntFetch(endpoint, method = 'GET', body = null) {
       port: url.port,
       path: url.pathname + url.search,
       headers: { 'Accept': 'application/json' },
-      timeout: 10000,
+      timeout: timeoutMs,
     };
     if (body) {
       const data = JSON.stringify(body);
@@ -246,6 +302,53 @@ async function handleToolCall(name, args) {
 
     case 'nt_execute_strategy': {
       const res = await ntFetch('/api/strategy/start', 'POST', args);
+      return res.data;
+    }
+
+    // ─── Phase 2 ────────────────────────────────────────────────────────
+    case 'nt_list_strategies': {
+      const res = await ntFetch('/api/strategies');
+      return res.data;
+    }
+
+    case 'nt_strategy_source': {
+      const res = await ntFetch(`/api/strategy/source?name=${encodeURIComponent(args.name)}`);
+      return res.data;
+    }
+
+    case 'nt_create_strategy': {
+      const res = await ntFetch('/api/strategy/create', 'POST', {
+        name: args.name,
+        source: args.source,
+        overwrite: args.overwrite !== false,
+      });
+      return res.data;
+    }
+
+    case 'nt_compile': {
+      // A SUCCESSFUL compile hot-swaps the NinjaScript AppDomain, which tears down
+      // the bridge's HTTP listener mid-response — the POST connection drops. That
+      // dropped connection is actually the success signal. Either way, the authoritative
+      // result is written to a durable file: read it back from /api/compile/result.
+      try {
+        await ntFetch('/api/compile', 'POST', { debug: !!args.debug }, 30000);
+      } catch {
+        // expected on success (connection reset by the hot-swap) — fall through to poll
+      }
+      // give the AppDomain a moment to reload, then fetch the durable result
+      for (let i = 0; i < 15; i++) {
+        await new Promise((r) => setTimeout(r, 1500));
+        try {
+          const res = await ntFetch('/api/compile/result', 'GET', null, 5000);
+          if (res.status === 200 && res.data && typeof res.data === 'object') return res.data;
+        } catch { /* bridge still reloading — retry */ }
+      }
+      return { error: 'compile result unavailable (bridge may still be reloading — try nt_compile result via /api/compile/result)' };
+    }
+
+    case 'nt_backtest': {
+      // Backtests run synchronously server-side and can take a while; use a long timeout.
+      const res = await ntFetch('/api/backtest', 'POST', args, 300000);
       return res.data;
     }
 
