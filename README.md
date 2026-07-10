@@ -4,7 +4,7 @@
 
 Connect AI agents (Claude, Hermes, ChatGPT, Cursor, Cline) to **NinjaTrader 8** via the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/).
 
-Your AI can read positions, check balances, place and cancel orders, fetch real-time quotes, pull historical bars, search instruments, and run NinjaScript strategies — through a single stdio interface.
+Your AI can read positions, check balances, place and cancel orders, fetch real-time quotes, pull historical bars, and search instruments — and, in Phase 2, **author NinjaScript strategies, compile them in-process (hot-swap, no NT8 restart), and backtest them through the Strategy Analyzer** with a configurable symbol, date range, timeframe, and parameters — all through a single stdio interface.
 
 ## Architecture
 
@@ -34,7 +34,7 @@ and compile via NinjaScript Editor (F5).
 Verify the AddOn is running:
 ```powershell
 curl http://localhost:7890/api/health
-# {"status":"ok","timestamp":"...","version":"0.1.0"}
+# {"status":"ok","timestamp":"...","version":"0.2.1","dev":false}
 ```
 
 ### 2. Start the MCP Server
@@ -112,12 +112,19 @@ Example `nt_backtest` — the same strategy over a specific symbol, date range, 
 
 ## Configuration
 
-Environment variables:
+**MCP server** (`nt-mcp-server.js`, on the AI-client machine):
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `NT8_HOST` | `127.0.0.1` | NT8 AddOn hostname |
 | `NT8_PORT` | `7890` | NT8 AddOn HTTP port |
+
+**AddOn** (`McpBridgeAddOn.cs`, on the NinjaTrader machine):
+
+| Variable / marker | Default | Description |
+|-------------------|---------|-------------|
+| `NT8_MCP_PREFIX` | `http://localhost:7890/` | HTTP bind prefix. Set to `http://+:7890/` to also listen on a **private** VPN interface (e.g. Tailscale) for remote access. Never expose publicly without auth + firewall. |
+| `NT8_MCP_DEV` env or `mcp_dev.on` marker file (in the NT8 user-data dir) | off | Enables the dev-only reflection endpoint (`/api/dev/reflect`) for internal probing. Off by default; leave off in normal use. |
 
 ## How Phase 2 works
 
@@ -145,10 +152,10 @@ result is written to a durable file and `nt_compile` reads it back automatically
 
 MIT — do what you want, no strings attached. See [LICENSE](LICENSE).
 
-## Based on work from Original Author
+## Credits
 
-Built by [Igor](https://github.com/Wendigooor) and his AI agent Hermes.
-
-## Updated capabilities Authored By:
-
-Quant Trading Pro: (https://www.quanttradingpro.com/)
+- **Phase 1** (accounts, trading, quotes, bars, instrument search) — original work by
+  [Igor](https://github.com/Wendigooor) and his AI agent Hermes.
+- **Phase 2** (strategy authoring, in-process compile with hot-swap, and Strategy Analyzer
+  backtesting with configurable symbol / date range / timeframe / parameters) — by
+  [**Quant Trading Pro**](https://www.quanttradingpro.com/).
