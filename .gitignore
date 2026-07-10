@@ -3,3 +3,7 @@ node_modules/
 *.log
 .DS_Store
 *.user
+exports/
+strategies/
+*.csv
+__pycache__/

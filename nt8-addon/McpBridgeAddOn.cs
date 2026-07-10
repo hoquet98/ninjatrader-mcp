@@ -179,6 +179,8 @@ namespace NinjaTrader.NinjaScript.AddOns
                     return GetBars(query["symbol"], query["period"] ?? "Minute",
                         int.Parse(query["periodValue"] ?? "1"), int.Parse(query["count"] ?? "100"));
                 case "/api/search":             return SearchInstruments(query["query"]);
+                case "/api/bars/export":        return Post(method, () => ExportBars(body));
+                case "/api/export":             return ReadExportFile(query["name"]);
                 case "/api/order":              return Post(method, () => PlaceOrder(body));
                 case "/api/order/cancel":       return Post(method, () => CancelOrder(body));
                 case "/api/orders/cancel-all":  return Post(method, () => CancelAllOrders());
@@ -640,14 +642,36 @@ namespace NinjaTrader.NinjaScript.AddOns
             var cur = tp != null ? GetP(tp, "Currency") : null; // TradesPerformanceValues
 
             var trades = new List<object>();
-            int total = 0;
+            int total = 0, winners = 0, losers = 0;
+            // Aggregate P&L per distinct entry (scale-out exits share one entry) so we can report
+            // entry-level win rate — comparable to research/kernel numbers, unlike per-partial-trade WR.
+            var entryPnl = new Dictionary<string, double>();
+            var exitReasons = new Dictionary<string, int>();   // per-partial-exit tally by exit order name
+            DateTime firstEntry = DateTime.MaxValue, lastExit = DateTime.MinValue;
             if (all is IEnumerable en)
                 foreach (var tr in en)
                 {
                     total++;
-                    if (trades.Count >= maxTrades) continue;   // still count the rest
                     var entryExec = GetP(tr, "Entry");         // Execution
                     var exitExec = GetP(tr, "Exit");
+                    var pc = GetP(tr, "ProfitCurrency");
+                    double pcd = pc is double dd ? dd : 0;
+                    if (pcd > 0) winners++; else if (pcd < 0) losers++;
+                    if (GetP(entryExec, "Time") is DateTime et)
+                    {
+                        if (et < firstEntry) firstEntry = et;
+                        var ekey = et.Ticks + "|" + SafeToString(GetP(entryExec, "MarketPosition"));
+                        entryPnl[ekey] = (entryPnl.TryGetValue(ekey, out var pv) ? pv : 0) + pcd;
+                    }
+                    if (GetP(exitExec, "Time") is DateTime xt && xt > lastExit) lastExit = xt;
+                    // Exit-reason tally: the exit order's signal name ("bank","runner","flat","time",
+                    // "Stop loss", ...). Falls back to the exit order's Name if Execution.Name is empty.
+                    var xname = SafeToString(GetP(exitExec, "Name"));
+                    if (string.IsNullOrWhiteSpace(xname) || xname == "<toString threw>")
+                        xname = SafeToString(GetP(GetP(exitExec, "Order"), "Name"));
+                    if (!string.IsNullOrWhiteSpace(xname))
+                        exitReasons[xname] = (exitReasons.TryGetValue(xname, out var xc) ? xc : 0) + 1;
+                    if (trades.Count >= maxTrades) continue;   // still count the rest
                     trades.Add(new
                     {
                         instrument = SafeToString(GetP(entryExec, "Instrument") is object inst ? GetP(inst, "FullName") : null),
@@ -657,20 +681,42 @@ namespace NinjaTrader.NinjaScript.AddOns
                         exitPrice = GetP(exitExec, "Price"),
                         entryTime = GetP(entryExec, "Time"),
                         exitTime = GetP(exitExec, "Time"),
-                        profitCurrency = GetP(tr, "ProfitCurrency"),
+                        profitCurrency = pc,
                         profitPoints = GetP(tr, "ProfitPoints"),
+                        exitName = GetP(exitExec, "Name"),
                     });
                 }
 
+            double gp = D(tp, "GrossProfit") is double g1 ? g1 : 0;
+            double gl = D(tp, "GrossLoss") is double g2 ? g2 : 0;
+            int entries = entryPnl.Count;
+            int winEntries = entryPnl.Values.Count(v => v > 0);
+            // Per-ENTRY loss/win profile (kernel-comparable: the scale-out means a full position
+            // outcome, not per-partial). This is the diagnostic for "are losers riding to the stop".
+            var winVals = entryPnl.Values.Where(v => v > 0).ToList();
+            var lossVals = entryPnl.Values.Where(v => v < 0).ToList();
+            double? avgWinEntry = winVals.Count > 0 ? (double?)Math.Round(winVals.Average(), 2) : null;
+            double? avgLossEntry = lossVals.Count > 0 ? (double?)Math.Round(lossVals.Average(), 2) : null;
+            double? maxLossEntry = lossVals.Count > 0 ? (double?)Math.Round(lossVals.Min(), 2) : null;
             return new
             {
                 summary = SafeToString(entry),
                 metrics = new
                 {
+                    entries,
+                    entryWinRatePct = entries > 0 ? Math.Round(100.0 * winEntries / entries, 1) : 0,   // per-entry (kernel-comparable)
+                    avgWinEntry,
+                    avgLossEntry,
+                    maxLossEntry,
+                    exitReasons,
                     totalTrades = D(tp, "TradesCount"),
+                    winners,
+                    losers,
+                    tradeWinRatePct = total > 0 ? Math.Round(100.0 * winners / total, 1) : 0,           // per-NT8-trade (incl. scale-outs)
+                    profitFactor = gl != 0 ? Math.Round(gp / Math.Abs(gl), 3) : (double?)null,
                     tradesPerDay = D(tp, "TradesPerDay"),
-                    grossProfit = D(tp, "GrossProfit"),
-                    grossLoss = D(tp, "GrossLoss"),
+                    grossProfit = gp,
+                    grossLoss = gl,
                     totalCommission = D(tp, "TotalCommission"),
                     maxConsecWinners = D(tp, "MaxConsecutiveWinner"),
                     maxConsecLosers = D(tp, "MaxConsecutiveLoser"),
@@ -680,6 +726,8 @@ namespace NinjaTrader.NinjaScript.AddOns
                     largestWinner = D(cur, "LargestWinner"),
                     largestLoser = D(cur, "LargestLoser"),
                     stdDev = D(cur, "StdDev"),
+                    firstEntry = firstEntry == DateTime.MaxValue ? null : (DateTime?)firstEntry,
+                    lastExit = lastExit == DateTime.MinValue ? null : (DateTime?)lastExit,
                 },
                 tradeCount = total,
                 tradesReturned = trades.Count,
@@ -1141,6 +1189,91 @@ namespace NinjaTrader.NinjaScript.AddOns
                     });
                 return new { symbol, period = periodStr, periodValue, count = result.Count, bars = result };
             }
+        }
+
+        // Export historical OHLCV bars over a DATE RANGE to a CSV file (for large pulls that would be
+        // impractical inline). Returns a summary + the file path/name; fetch the content via
+        // GET /api/export?name=<file>. NT8 fetches missing history from the data provider on demand.
+        private object ExportBars(string body)
+        {
+            var req = string.IsNullOrWhiteSpace(body) ? new JObject() : JObject.Parse(body);
+            var symbol = req.Str("symbol");
+            var periodStr = req.Str("period") ?? "Minute";
+            int periodValue = req["periodValue"] != null ? (int)req["periodValue"] : 1;
+            int timeoutSec = req["timeoutSec"] != null ? (int)req["timeoutSec"] : 180;
+            if (string.IsNullOrEmpty(symbol)) return new { error = "symbol required" };
+            if (!DateTime.TryParse(req.Str("from"), out var from)) return new { error = "from (YYYY-MM-DD) required" };
+            if (!DateTime.TryParse(req.Str("to"), out var to)) to = DateTime.Now;
+
+            var instrument = Instrument.GetInstrument(symbol);
+            if (instrument == null) return new { error = $"instrument not found: {symbol}" };
+            var periodType = (BarsPeriodType)Enum.Parse(typeof(BarsPeriodType), periodStr, true);
+            var bp = new BarsPeriod { BarsPeriodType = periodType, Value = periodValue };
+
+            int pv = Math.Max(1, periodValue);
+            // Continuous-contract merge policy. DoNotMerge = the resolved single contract (default).
+            // MergeNonBackAdjusted = real front-month prices spliced at rolls, NO price adjustment
+            // (matches a research-grade continuous series). MergeBackAdjusted shifts historical prices
+            // by cumulative roll gaps — do NOT use it for log-ratio / spread work.
+            var mergeStr = req.Str("merge") ?? "DoNotMerge";
+            MergePolicy merge;
+            if (!Enum.TryParse(mergeStr, true, out merge)) merge = MergePolicy.DoNotMerge;
+            // Warm the subscription (harmless for live contracts; expired ones fall back to history).
+            try { var _ = instrument.MarketData; } catch { }
+
+            string status = null;
+            var done = new ManualResetEventSlim(false);
+            var ci = System.Globalization.CultureInfo.InvariantCulture;
+            var safe = System.Text.RegularExpressions.Regex.Replace(symbol, "[^A-Za-z0-9]", "_");
+            var name = $"mcp_bars_{safe}_{periodStr}{pv}.csv";
+            var path = Path.Combine(Globals.UserDataDir, name);
+
+            // Direct DATE-RANGE request (from/to are local time). This downloads exactly the window
+            // from the provider — no oversized count, no client-side filtering.
+            using (var request = new BarsRequest(instrument, from, to) { BarsPeriod = bp, MergePolicy = merge })
+            {
+                request.Request((r, code, msg) => { status = code.ToString(); done.Set(); });
+                if (!done.Wait(TimeSpan.FromSeconds(timeoutSec)))
+                    return new { error = $"bars request timed out after {timeoutSec}s", symbol };
+
+                // IMPORTANT: read Bars BEFORE the BarsRequest is disposed (dispose clears them).
+                var bars = request.Bars;
+                if (bars == null || bars.Count == 0)
+                    return new { error = "no bars returned (provider may lack history for this range)", status, symbol };
+
+                using (var w = new StreamWriter(path, false))
+                {
+                    w.WriteLine("time,open,high,low,close,volume");
+                    for (int i = 0; i < bars.Count; i++)
+                        w.WriteLine(string.Join(",",
+                            bars.GetTime(i).ToString("yyyy-MM-ddTHH:mm:ss"),
+                            bars.GetOpen(i).ToString(ci), bars.GetHigh(i).ToString(ci),
+                            bars.GetLow(i).ToString(ci), bars.GetClose(i).ToString(ci),
+                            bars.GetVolume(i).ToString(ci)));
+                }
+                return new
+                {
+                    symbol = instrument.FullName, period = periodStr, periodValue = pv,
+                    merge = merge.ToString(),
+                    rows = bars.Count,
+                    first = bars.GetTime(0), last = bars.GetTime(bars.Count - 1),
+                    timeNote = "bar CLOSE time in NT8's configured timezone",
+                    file = name, path,
+                    fetch = $"GET /api/export?name={name}",
+                };
+            }
+        }
+
+        // Return the content of an export CSV (whitelisted to mcp_*.csv in the NT8 user-data dir),
+        // so exports/signal logs are pullable over the (private) network without file access.
+        private object ReadExportFile(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name)) return new { error = "name required" };
+            if (name.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0 || !name.StartsWith("mcp_") || !name.EndsWith(".csv"))
+                return new { error = "only mcp_*.csv export files are readable" };
+            var path = Path.Combine(Globals.UserDataDir, name);
+            if (!File.Exists(path)) return new { error = $"not found: {name}" };
+            return new { name, bytes = new FileInfo(path).Length, content = File.ReadAllText(path) };
         }
 
         private object SearchInstruments(string query)

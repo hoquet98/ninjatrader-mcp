@@ -113,6 +113,32 @@ const TOOLS = [
     },
   },
   {
+    name: 'nt_export_bars',
+    description: 'Export historical OHLCV bars over a DATE RANGE to a CSV file on the NT8 machine (NT8 downloads missing history from the data provider on demand). Returns a summary (rows, actual range, filename). Fetch the CSV content with nt_get_export or GET /api/export?name=<file>.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        symbol:      { type: 'string', description: 'Instrument (e.g. RTY 03-25, ES 09-26, M2K 09-26)' },
+        from:        { type: 'string', description: 'Start date YYYY-MM-DD' },
+        to:          { type: 'string', description: 'End date YYYY-MM-DD (default: now)' },
+        period:      { type: 'string', enum: ['Minute', 'Day', 'Second', 'Tick', 'Volume', 'Range'], description: 'Bars period type', default: 'Minute' },
+        periodValue: { type: 'number', description: 'Bars period value (e.g. 5 for 5m)', default: 1 },
+        merge:       { type: 'string', enum: ['DoNotMerge', 'MergeNonBackAdjusted', 'MergeBackAdjusted'], description: 'DoNotMerge = the single anchored contract. MergeNonBackAdjusted = continuous series stitched across front months with NO price adjustment (anchor on any real contract like "ES 09-26"). NEVER use MergeBackAdjusted for spread/log-ratio work — it shifts historical prices by cumulative roll gaps.', default: 'DoNotMerge' },
+        timeoutSec:  { type: 'number', description: 'Max seconds to wait for the provider download', default: 180 },
+      },
+      required: ['symbol', 'from'],
+    },
+  },
+  {
+    name: 'nt_get_export',
+    description: 'Fetch the content of an export CSV created by nt_export_bars (or a signal log), by filename. WARNING: large files (100k+ bars) can be huge — prefer reading the file directly if on the NT8 machine.',
+    inputSchema: {
+      type: 'object',
+      properties: { name: { type: 'string', description: 'Export filename, e.g. mcp_bars_RTY_03_25_Minute1.csv' } },
+      required: ['name'],
+    },
+  },
+  {
     name: 'nt_execute_strategy',
     description: 'Launch a strategy on a chart (local)',
     inputSchema: {
@@ -297,6 +323,22 @@ async function handleToolCall(name, args) {
 
     case 'nt_search': {
       const res = await ntFetch(`/api/search?query=${encodeURIComponent(args.query)}`);
+      return res.data;
+    }
+
+    case 'nt_export_bars': {
+      const timeoutMs = ((args.timeoutSec || 180) + 30) * 1000;
+      const res = await ntFetch('/api/bars/export', 'POST', {
+        symbol: args.symbol, from: args.from, to: args.to,
+        period: args.period || 'Minute', periodValue: args.periodValue || 1,
+        merge: args.merge || 'DoNotMerge',
+        timeoutSec: args.timeoutSec || 180,
+      }, timeoutMs);
+      return res.data;
+    }
+
+    case 'nt_get_export': {
+      const res = await ntFetch(`/api/export?name=${encodeURIComponent(args.name)}`, 'GET', null, 60000);
       return res.data;
     }
 
