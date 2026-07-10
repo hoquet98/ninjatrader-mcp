@@ -126,6 +126,32 @@ GC_PILOT = [
     ("COMEX:GC1!", "GC 08-26", contract_tag("GC",8,26),  "2026-05-15", "2026-07-01"),
 ]
 
+# Full GC history generator. Gold rolls G(Feb)->J(Apr)->M(Jun)->Q(Aug)->Z(Dec), skipping
+# V(Oct) (verified in the pilot). Windows overlap ~1 month each side so roll-overlap bars land
+# on both contracts; they intentionally match the pilot windows so completed chunks skip.
+#   month -> (from_MM-DD, to_MM-DD, year_offset_for_from)
+GC_MONTH_WIN = {
+    2:  ("11-15", "01-31", -1),   # Feb: prior-year Nov-15 -> Jan-31
+    4:  ("01-01", "03-31",  0),   # Apr
+    6:  ("03-01", "05-31",  0),   # Jun
+    8:  ("05-01", "08-31",  0),   # Aug (extends into Aug for the expiring tail)
+    12: ("07-15", "11-30",  0),   # Dec (starts Jul-15 to overlap the Aug roll)
+}
+def gc_full_chunks(start_year=2020, end="2026-07-10"):
+    chunks = []
+    for yy in range(start_year, int(end[:4]) + 1):
+        for mm in (2, 4, 6, 8, 12):
+            fmd, tmd, yoff = GC_MONTH_WIN[mm]
+            frm = f"{yy+yoff:04d}-{fmd}"
+            to  = f"{yy:04d}-{tmd}"
+            if frm > end:                 # contract's window starts after our cutoff -> skip
+                continue
+            if to > end:                  # clip the trailing contract to the cutoff day
+                to = end
+            tag = contract_tag("GC", mm, yy % 100)
+            chunks.append(("COMEX:GC1!", f"GC {mm:02d}-{yy % 100:02d}", tag, frm, to))
+    return chunks
+
 def run(chunks):
     cx = connect()
     total = 0
@@ -150,5 +176,6 @@ def status():
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
     if cmd == "gc-pilot": run(GC_PILOT)
+    elif cmd == "gc-full": run(gc_full_chunks(2020, "2026-07-10"))
     elif cmd == "status": status()
     else: print(__doc__)

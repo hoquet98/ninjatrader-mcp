@@ -24,22 +24,30 @@ def q1_density(cx):
     mn, mx, n, nc = c.fetchone()
     print(f"raw: {n} rows, {nc} contracts, {mn} -> {mx}")
     print(f"reaches 2020-01-01? {'YES' if mn and mn.date() <= dt.date(2020,1,1) else 'NO — '+str(mn)}")
-    # bars per DISTINCT trading-day on the continuous view; per month: trading days, avg/day,
-    # thinnest day, # of thin days (<600 bars = clearly partial), and missing weekdays (gaps).
+    # per-YEAR density over the full loaded range; trading days, avg/day, thin days (<600),
+    # missing weekdays (gaps). Range = 2020-01-01 .. max(ts).
+    end = mx.date()
     c.execute(f"""
       with cont as ({CONT}),
       perday as (select ts::date d, count(*) bars from cont group by d),
-      allwd as (select gs::date d from generate_series(%s::date, %s::date, interval '1 day') gs
+      allwd as (select gs::date d from generate_series('2020-01-01'::date, %s::date, interval '1 day') gs
                 where extract(isodow from gs) < 6)
-      select date_trunc('month', coalesce(p.d, w.d))::date m,
+      select extract(year from coalesce(p.d,w.d))::int y,
              count(p.d) trading_days, round(avg(p.bars)) avg_day, min(p.bars) thin_day,
-             sum((p.bars<600)::int) thin_lt600, count(*) filter (where p.d is null) missing_weekdays
+             sum((p.bars<600)::int) thin_lt600, count(*) filter (where p.d is null) missing_wd
       from allwd w left join perday p on p.d=w.d
-      where coalesce(p.d,w.d) >= '2020-01-01' and coalesce(p.d,w.d) < '2021-01-01'
-      group by m order by m""", (SYM, dt.date(2020,1,1), dt.date(2020,12,31)))
-    print(f"{'month':>10} {'tdays':>6} {'avg/day':>8} {'thin_day':>9} {'#<600':>6} {'missWD':>7}")
-    for m, td, avg, thin, lt6, miss in c.fetchall():
-        print(f"{str(m):>10} {td:>6} {avg:>8} {thin:>9} {lt6:>6} {miss:>7}")
+      group by y order by y""", (SYM, end))
+    print(f"{'year':>6} {'tdays':>6} {'avg/day':>8} {'thin_day':>9} {'#<600':>6} {'missWD':>7}")
+    for y, td, avg, thin, lt6, miss in c.fetchall():
+        print(f"{y:>6} {td:>6} {avg:>8} {thin:>9} {lt6:>6} {miss:>7}")
+    # list the actual missing weekdays (true gaps, holidays aside)
+    c.execute(f"""
+      with cont as ({CONT}), perday as (select ts::date d from cont group by 1),
+      allwd as (select gs::date d from generate_series('2020-01-01'::date, %s::date, interval '1 day') gs
+                where extract(isodow from gs) < 6)
+      select w.d from allwd w left join perday p on p.d=w.d where p.d is null order by w.d""", (SYM, end))
+    miss = [r[0] for r in c.fetchall()]
+    print(f"missing weekdays ({len(miss)}, expect only holidays): {miss[:25]}{'...' if len(miss)>25 else ''}")
 
 def q2_roll_continuity(cx):
     print("\n=== QA2 ROLL CONTINUITY (dominant-volume front contract) ===")

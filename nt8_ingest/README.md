@@ -59,6 +59,23 @@ python qa.py gc              # the 4 QA checks
 - GC follows the **even-month** roll cycle (Feb/Apr/Jun/Aug/Oct/Dec); windows overlap ~1 month
   each side so overlap bars are captured for downstream dedup.
 
+## Known data gaps — recorded, never patched
+Single-vendor means real feed holes are **surfaced, not filled**. Every genuine missing span is
+logged in `nt8_data_gaps(symbol, gap_start, gap_end, note)`; downstream treats these as known-missing.
+
+- **COMEX:GC1! 2023-04-06 → 2023-04-15** — genuine NT8/Tradovate 1-min hole (verified empty on
+  both the GCM23 front and the expiring GCJ23). The legacy `ohlcv_bars` *had* this week (from
+  Databento) — i.e. the composite silently cross-vendor-patched it. Left missing on purpose.
+
+QA1's "missing weekdays" list is the gap detector: everything else in it is a market holiday
+(Good Friday, Christmas, New Year's).
+
+## Status
+- **GC — COMPLETE (2020-01-01 → 2026-07-10):** 2,908,798 raw rows across 34 contracts
+  (2,340,101 continuous 1-min bars + 568,697 roll-overlap bars). All 4 QA checks passed except
+  the lineage gate (DEFERRED). One recorded gap (above).
+- CL / SI / ES / NQ / RTY — pending (next).
+
 ## QA (mandatory before declaring done)
 1. **Density** — rows/trading-day/year; flag gaps; confirm coverage reaches 2020-01-01.
 2. **Roll continuity** — 2–3 roll boundaries; no phantom price step (proves non-back-adjusted);
