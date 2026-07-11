@@ -152,6 +152,41 @@ def gc_full_chunks(start_year=2020, end="2026-07-10"):
             chunks.append(("COMEX:GC1!", f"GC {mm:02d}-{yy % 100:02d}", tag, frm, to))
     return chunks
 
+# ── generalized per-instrument chunk generator ──────────────────────────────
+# Each instrument has an active-month set and a per-contract window covering its liquid life
+# plus roll overlaps. Windows overlap adjacent contracts so overlap bars land on both; a
+# contract only returns its real data (full during its front period, thin tails), so wide
+# windows are safe. Verified per-instrument by the volume-roll + gap QA.
+#   config: (canonical, nt8_root, active_months, from_offset_months, to_day)
+INSTRUMENTS = {
+    "cl":  ("NYMEX:CL1!", "CL",  list(range(1, 13)),   3, 28),   # crude: all 12 months, monthly roll
+    "si":  ("COMEX:SI1!", "SI",  [3, 5, 7, 9, 12],      4, 28),   # silver: H/K/N/U/Z
+    "es":  ("CME:ES1!",   "ES",  [3, 6, 9, 12],         4, 25),   # S&P: quarterly H/M/U/Z
+    "nq":  ("CME:NQ1!",   "NQ",  [3, 6, 9, 12],         4, 25),   # Nasdaq: quarterly
+    "rty": ("CME:RTY1!",  "RTY", [3, 6, 9, 12],         4, 25),   # Russell: quarterly (from ~2017)
+    "gc":  ("COMEX:GC1!", "GC",  [2, 4, 6, 8, 12],      4, 28),   # gold: G/J/M/Q/Z (Oct skipped)
+}
+
+def _add_months(y, m, delta):
+    idx = (y * 12 + (m - 1)) + delta
+    return idx // 12, idx % 12 + 1
+
+def instrument_chunks(key, start_year=2020, end="2026-07-10"):
+    canonical, root, months, off, to_day = INSTRUMENTS[key]
+    chunks = []
+    for yy in range(start_year, int(end[:4]) + 1):
+        for mm in months:
+            fy, fm = _add_months(yy, mm, -off)
+            frm = f"{fy:04d}-{fm:02d}-01"
+            to  = f"{yy:04d}-{mm:02d}-{to_day:02d}"
+            if frm > end:
+                continue
+            if to > end:
+                to = end
+            tag = contract_tag(root, mm, yy % 100)
+            chunks.append((canonical, f"{root} {mm:02d}-{yy % 100:02d}", tag, frm, to))
+    return chunks
+
 def run(chunks):
     cx = connect()
     total = 0
@@ -177,5 +212,10 @@ if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
     if cmd == "gc-pilot": run(GC_PILOT)
     elif cmd == "gc-full": run(gc_full_chunks(2020, "2026-07-10"))
+    elif cmd in INSTRUMENTS: run(instrument_chunks(cmd, 2020, "2026-07-10"))
+    elif cmd == "all-rest":
+        for k in ("cl", "si", "es", "nq", "rty"):
+            print(f"\n########## {INSTRUMENTS[k][0]} ##########")
+            run(instrument_chunks(k, 2020, "2026-07-10"))
     elif cmd == "status": status()
     else: print(__doc__)

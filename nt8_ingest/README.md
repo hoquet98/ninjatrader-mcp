@@ -49,8 +49,13 @@ nt8_ingest_checkpoint(canonical, nt8_symbol, contract, from_date, to_date, rows_
 ## Running
 ```
 python ingest.py gc-pilot   # GC pilot: Slice A (2020, 7 even-month contracts) + Slice B (2026-06)
+python ingest.py gc-full    # full GC 2020-01-01 -> today
+python ingest.py cl         # a single instrument (cl|si|es|nq|rty|gc)
+python ingest.py all-rest   # CL/SI/ES/NQ/RTY back to back
 python ingest.py status     # checkpoint progress + table summary
-python qa.py gc              # the 4 QA checks
+python qa.py gc             # the 4 QA checks (GC)
+python qa_all.py            # density + gap + roll-continuity for cl/si/es/nq/rty
+python qa_all.py rty        # one instrument
 ```
 - **Idempotent:** `INSERT ... ON CONFLICT (symbol,contract,ts) DO NOTHING`.
 - **Resumable:** each (contract, window) checkpointed `done`; a restart skips completed chunks.
@@ -63,18 +68,47 @@ python qa.py gc              # the 4 QA checks
 Single-vendor means real feed holes are **surfaced, not filled**. Every genuine missing span is
 logged in `nt8_data_gaps(symbol, gap_start, gap_end, note)`; downstream treats these as known-missing.
 
-- **COMEX:GC1! 2023-04-06 → 2023-04-15** — genuine NT8/Tradovate 1-min hole (verified empty on
-  both the GCM23 front and the expiring GCJ23). The legacy `ohlcv_bars` *had* this week (from
-  Databento) — i.e. the composite silently cross-vendor-patched it. Left missing on purpose.
+- **The April-2023 hole (2023-04-06 → 2023-04-15)** — a genuine NT8/Tradovate 1-min outage that
+  hit **GC, SI, and RTY only**. Verified against raw rows: the front contracts that span the week
+  (GCM23/GCJ23, SIK23, RTYM23) return bars up to 2023-04-05 18:02 UTC and resume 2023-04-16 22:00
+  UTC, with **zero bars in between**. The same week is **fully present for CL, ES, and NQ**
+  (13.7k / 10.6k / 10.3k rows) — so it is instrument-specific, not a calendar closure. The legacy
+  `ohlcv_bars` *had* this week for GC (from Databento) — i.e. the composite silently
+  cross-vendor-patched it. Left missing on purpose for all three.
 
-QA1's "missing weekdays" list is the gap detector: everything else in it is a market holiday
+QA's "missing weekdays" list is the gap detector: everything else in it is a market holiday
 (Good Friday, Christmas, New Year's).
 
-## Status
-- **GC — COMPLETE (2020-01-01 → 2026-07-10):** 2,908,798 raw rows across 34 contracts
-  (2,340,101 continuous 1-min bars + 568,697 roll-overlap bars). All 4 QA checks passed except
-  the lineage gate (DEFERRED). One recorded gap (above).
-- CL / SI / ES / NQ / RTY — pending (next).
+## Data faithfulness notes (real, not glitches)
+- **CL April 2020 negative oil** — CLK20 (May-2020 WTI) carries 757 sub-$10/negative 1-min bars
+  down to **−39.55** on 2020-04-20/21. That is the historic negative-crude settlement, faithfully
+  captured — kept as-is.
+- **CLF24 post-expiry junk** — exactly 2 garbage prints (1.25 and 4924.51 on 2024-01-19, a month
+  after CLF24 expired) survive in raw storage on the dead contract. They are **masked entirely by
+  the newest-contract dedup** (0 junk bars in the continuous view), so downstream never sees them.
+  Left as the faithful record of what the vendor returned.
+- **Largest 1-min moves are real events, not back-adjustment artifacts** — the biggest intra-
+  contract jumps are the 2020-03-16 COVID limit-down and the 2025-04-06 tariff-crash Sunday reopen
+  (ES −164, NQ −777). Back-adjustment would instead show phantom steps at the *rolls*; roll
+  calendar spreads are small and real (ES ≈ −11, NQ ≈ −13, CL/SI < 0.3), confirming non-back-adjusted.
+
+## Status — ALL SIX INSTRUMENTS COMPLETE (2020-01-01 → 2026-07-10)
+~19.6M raw rows; every contract loaded `[ok]`, density ~1300 bars/trading-day, all reach past
+2020-01-01. Lineage gate **DEFERRED** for every instrument (no NT8/Tradovate live capture exists).
+
+| symbol      | rows      | contracts | notes |
+|-------------|-----------|-----------|-------|
+| NYMEX:CL1!  | 5,545,798 | 82        | monthly roll; incl. real 2020 negative oil |
+| COMEX:GC1!  | 2,908,798 | 34        | Apr-2023 gap logged |
+| COMEX:SI1!  | 2,894,955 | 34        | Apr-2023 gap logged |
+| CME:ES1!    | 2,964,458 | 27        | quarterly; clean |
+| CME:NQ1!    | 2,819,016 | 27        | quarterly; clean |
+| CME:RTY1!   | 2,483,416 | 27        | Apr-2023 gap logged |
+
+QA verdict per instrument: **density** OK (all reach 2020, no unexplained thin spans — the only
+missing weekdays are market holidays + the logged Apr-2023 hole); **roll continuity** OK (small
+real calendar spreads, no phantom steps → confirms non-back-adjusted); **spot-checks** consistent
+(negative-oil, COVID/tariff crash magnitudes real). **Lineage gate DEFERRED** (not passed).
 
 ## QA (mandatory before declaring done)
 1. **Density** — rows/trading-day/year; flag gaps; confirm coverage reaches 2020-01-01.

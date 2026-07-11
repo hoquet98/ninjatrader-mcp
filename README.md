@@ -169,7 +169,8 @@ result is written to a durable file and `nt_compile` reads it back automatically
 - `nt_chart_state` / `nt_indicator_values` — read chart state + live indicator values
 - `nt_deploy_strategy` — deploy, verify, and monitor a strategy in production
 - Full backtest → optimize → deploy → monitor pipeline
-- Data archive: remaining instruments (CL/SI/ES/NQ/RTY) + the NT8-live-capture lineage gate
+- Data archive: all six instruments (CL/GC/SI/ES/NQ/RTY) loaded 2020→present (~19.6M rows);
+  remaining work is the NT8-live-capture lineage gate (currently DEFERRED)
 
 ## Requirements
 
