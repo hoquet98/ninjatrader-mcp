@@ -4,7 +4,7 @@
 
 Connect AI agents (Claude, Hermes, ChatGPT, Cursor, Cline) to **NinjaTrader 8** via the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/).
 
-Your AI can read positions, check balances, place and cancel orders, fetch real-time quotes, pull historical bars, and search instruments — and, in Phase 2, **author NinjaScript strategies, compile them in-process (hot-swap, no NT8 restart), and backtest them through the Strategy Analyzer** with a configurable symbol, date range, timeframe, and parameters — all through a single stdio interface.
+Your AI can read positions, check balances, place and cancel orders, fetch real-time quotes, pull historical bars, and search instruments; **author NinjaScript strategies, compile them in-process (hot-swap, no NT8 restart), and backtest them through the Strategy Analyzer**; and **extract historical bar data — to CSV or straight into a Postgres table** — all through a single stdio interface.
 
 ## Architecture
 
@@ -110,6 +110,34 @@ Example `nt_backtest` — the same strategy over a specific symbol, date range, 
   "params": { "Fast": 5, "Slow": 50 }, "maxTrades": 50 }
 ```
 
+### Phase 3 — historical data extraction
+
+| Tool | Description |
+|------|-------------|
+| `nt_export_bars` | Export a **date range** of OHLCV bars to a CSV on the NT8 machine (NT8 downloads missing history on demand). Configurable `symbol`, `from`/`to`, `period`/`periodValue`, and `merge` policy. Returns a summary (rows, actual range, filename). |
+| `nt_get_export` | Return the content of an export CSV by filename (for pulling it over the private network). |
+
+**Two extraction modes:**
+
+1. **Return CSV** — `nt_export_bars` writes `mcp_bars_<symbol>_<period>.csv`; fetch it with
+   `nt_get_export` (or read the file directly if you're on the NT8 machine).
+   ```jsonc
+   { "symbol": "GC 08-26", "from": "2020-01-01", "to": "2026-07-10",
+     "period": "Minute", "periodValue": 1, "merge": "DoNotMerge" }
+   ```
+   - `merge`: **`DoNotMerge`** = the single resolved contract; **`MergeNonBackAdjusted`** = a continuous
+     series stitched across front months with **no price adjustment** (anchor on a real contract, e.g.
+     `GC 08-26`). **Never `MergeBackAdjusted`** for spread/ratio work — it shifts historical prices by
+     cumulative roll gaps and corrupts the signal.
+   - Depth (Tradovate feed): ES/GC/CL/SI/NQ ~2006–2008, **RTY ~2017**, **M2K ~2019** (launch-limited).
+   - Timestamps are NT8-local **bar-close**; convert to your target convention on load (see below).
+
+2. **Load to a Postgres table** — [`nt8_ingest/`](nt8_ingest/) builds a **single-vendor, provenance-tagged**
+   1-minute archive (`nt8_ohlcv_bars`) from these exports: per-contract, non-back-adjusted, roll-overlap
+   bars kept, UTC bar-open timestamps (converted from NT8's Central bar-close), idempotent + resumable,
+   with QA (density/rolls/spot-check) and a `nt8_data_gaps` registry that **records feed holes instead of
+   cross-vendor patching them**. See [nt8_ingest/README.md](nt8_ingest/README.md).
+
 ## Configuration
 
 **MCP server** (`nt-mcp-server.js`, on the AI-client machine):
@@ -135,12 +163,13 @@ but triggered over HTTP with **no restart**. Backtests are run by driving a brid
 from the GUI). A successful compile briefly drops the HTTP connection as the AppDomain reloads; the
 result is written to a durable file and `nt_compile` reads it back automatically.
 
-## Roadmap (Phase 3)
+## Roadmap (Phase 4)
 
 - `nt_optimize` — parameter optimization via the Strategy Analyzer optimizer
 - `nt_chart_state` / `nt_indicator_values` — read chart state + live indicator values
 - `nt_deploy_strategy` — deploy, verify, and monitor a strategy in production
 - Full backtest → optimize → deploy → monitor pipeline
+- Data archive: remaining instruments (CL/SI/ES/NQ/RTY) + the NT8-live-capture lineage gate
 
 ## Requirements
 
