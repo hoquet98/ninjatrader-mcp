@@ -4,7 +4,32 @@
 
 Connect AI agents (Claude, Hermes, ChatGPT, Cursor, Cline) to **NinjaTrader 8** via the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/).
 
-Your AI can read positions, check balances, place and cancel orders, fetch real-time quotes, pull historical bars, and search instruments; **author NinjaScript strategies, compile them in-process (hot-swap, no NT8 restart), and backtest them through the Strategy Analyzer**; and **extract historical bar data — to CSV or straight into a Postgres table** — all through a single stdio interface.
+Through a single stdio interface, this MCP lets an AI agent:
+
+**Account Management**
+- List accounts with balances and buying power
+- Read open positions with live P&L
+- List working orders with their status
+
+**Live Trading**
+- Place Market / Limit / StopMarket / StopLimit orders
+- Cancel an order by ID/name, or cancel all working orders at once
+- Stream real-time quotes (bid, ask, last, volume, daily high/low)
+
+**Strategy Development**
+- Author full NinjaScript strategy source
+- Compile it in-process via NinjaTrader's own Roslyn compiler — hot-swapped, **no NT8 restart**
+- Launch a compiled strategy live on a chart
+
+**Backtesting**
+- Run backtests through the Strategy Analyzer over a configurable **symbol, date range, timeframe, and parameters**
+- Read back net P&L, drawdown, gross P/L, trade count, and the full trade list
+
+**Historical Market Data**
+- Export OHLCV bar ranges (Minute/Day/Tick/Volume/Range) to CSV
+- Build a single-vendor, provenance-tagged 1-minute Postgres archive (`nt8_ohlcv_bars`)
+- Keep it current with a scheduled daily incremental updater
+- Search instruments by name or symbol
 
 ## Architecture
 
