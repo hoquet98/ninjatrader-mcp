@@ -56,7 +56,48 @@ python ingest.py status     # checkpoint progress + table summary
 python qa.py gc             # the 4 QA checks (GC)
 python qa_all.py            # density + gap + roll-continuity for cl/si/es/nq/rty
 python qa_all.py rty        # one instrument
+python daily_update.py      # incremental daily refresh (see below)
+python daily_update.py --dry  # show which contracts/window it would pull
 ```
+
+## Daily incremental updater (`daily_update.py`)
+Keeps the archive current. Each run pulls a short **trailing window** (`TRAIL_DAYS=5`) of every
+contract that has traded in the last `LOOKBACK_DAYS`, plus the **next contract after the current
+front** (by recent volume) to seed the upcoming roll early, and upserts them.
+
+- **When:** scheduled daily at **16:20 CT**, inside the 16:00-17:00 CT CME maintenance break — the
+  Globex trade-date has just closed at 16:00 CT, so the session is complete and no bar is forming.
+- **Self-healing:** the 5-day trailing window means a missed run (machine off, NT8 down) is
+  recovered by the next run; no manual catch-up.
+- **Idempotent + partial-safe:** upserts `ON CONFLICT DO UPDATE` (the live tail may re-pull a
+  minute that was partial in an earlier run and refresh it to its settled values — re-pulled
+  historical minutes are identical, so a settled bar is never corrupted). A still-forming bar
+  (close-stamp in the future) is dropped before insert. *(The historical backfill in `ingest.py`
+  keeps `DO NOTHING`; this DO UPDATE is deliberate and specific to the live tail.)*
+- **Single-vendor:** only adds bars NT8/Tradovate returns; never fills gaps.
+- **Logs:** appended to `logs/daily_update.log` (gitignored). A not-yet-listed seed contract is
+  skipped quietly; a real export/DB error is logged as `[FAIL]` (and per-contract, so one bad pull
+  never aborts the run).
+
+### Windows Scheduled Task
+Registered as **`nt8_daily_ohlcv`**, runs in the logged-in NT8 session (the bridge is on
+`localhost:7890`). Machine timezone is US Central, so the 16:20 trigger is DST-correct year-round.
+```powershell
+# inspect / run / remove
+Get-ScheduledTaskInfo -TaskName nt8_daily_ohlcv           # LastTaskResult (0=ok), NextRunTime
+Start-ScheduledTask     -TaskName nt8_daily_ohlcv          # run now
+Unregister-ScheduledTask -TaskName nt8_daily_ohlcv -Confirm:$false   # remove
+
+# (re)register
+$py='C:\Program Files\Python313\python.exe'; $s='C:\Users\Administrator\nt8-mcp\nt8_ingest\daily_update.py'
+$a=New-ScheduledTaskAction -Execute $py -Argument "`"$s`"" -WorkingDirectory (Split-Path $s)
+$t=New-ScheduledTaskTrigger -Daily -At (Get-Date -Hour 16 -Minute 20 -Second 0)
+$set=New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 20) -MultipleInstances IgnoreNew
+Register-ScheduledTask -TaskName nt8_daily_ohlcv -Action $a -Trigger $t -Settings $set -Force
+```
+**Prereq:** NinjaTrader 8 must be running (with the MCP AddOn) in that session, since the pull hits
+its bridge. If NT8 is down the run logs `[FATAL] bridge unreachable` and exits non-zero; the next
+run backfills the missed days.
 - **Idempotent:** `INSERT ... ON CONFLICT (symbol,contract,ts) DO NOTHING`.
 - **Resumable:** each (contract, window) checkpointed `done`; a restart skips completed chunks.
 - **Chunked:** one contract-window per bridge call; never one giant pull.
