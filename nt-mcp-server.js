@@ -217,12 +217,13 @@ const TOOLS = [
   },
   {
     name: 'nt_stop_strategy',
-    description: 'Stop running strategies: disable and remove them from the chart. Filter by strategy class name and/or account (omit both to stop all). Does NOT auto-flatten an open position — use nt_place_order if you need to flatten.',
+    description: 'Stop running strategies: disable and remove them from the chart, and (by default) flatten any open position with an offsetting market order. Filter by strategy class name and/or account (omit both to stop all).',
     inputSchema: {
       type: 'object',
       properties: {
         strategy: { type: 'string', description: 'Strategy class name to stop (omit = all)' },
         account:  { type: 'string', description: 'Limit to this account (omit = all)' },
+        flatten:  { type: 'boolean', description: 'Flatten the stopped strategy\'s open position via an offsetting market order', default: true },
       },
     },
   },

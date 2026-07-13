@@ -1164,7 +1164,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 {
                     object cc, cb;
                     if (!FindChartControl(instrument, out cc, out cb) || cc == null || cb == null)
-                    { result = new { error = "no open chart found for instrument '" + instrument + "' — open a chart for it first" }; return; }
+                    { result = new { error = "could not access a chart control for '" + instrument + "'. Deploy attaches to a chart that already hosts a strategy on this instrument (NT8 does not expose a strategy-less chart's control). Apply the first strategy for this instrument via the NT8 Strategies dialog; deploy can then add/manage strategies on it." }; return; }
 
                     var strat = Activator.CreateInstance(stratType);   // ctor runs SetDefaults
                     SetP(strat, "Account", account);
@@ -1201,6 +1201,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             var req = string.IsNullOrWhiteSpace(body) ? new JObject() : JObject.Parse(body);
             string stratName = req.Str("strategy");
             string accountName = req.Str("account");
+            bool flatten = req["flatten"] == null || (bool)req["flatten"];
             var stopped = new List<object>(); Exception err = null;
             var disp = System.Windows.Application.Current?.Dispatcher;
             if (disp == null) return new { error = "no WPF dispatcher (NT8 UI down?)" };
@@ -1227,11 +1228,28 @@ namespace NinjaTrader.NinjaScript.AddOns
                                 foreach (var tmpl in col)
                                     if (tmpl != null && Equals(GetMember(tmpl, "Id"), cloneId)) { template = tmpl; break; }
                             if (template == null) template = clone;
-                            var posBefore = GetMember(GetMember(clone, "Position"), "MarketPosition")?.ToString();
+                            var posObj = GetMember(clone, "Position");
+                            var posBefore = GetMember(posObj, "MarketPosition")?.ToString();
+                            int posQty = 0; try { posQty = Convert.ToInt32(GetMember(posObj, "Quantity")); } catch { }
+                            var instr = GetMember(clone, "Instrument") as Instrument;
                             try { InvokeStaticM(cc.GetType(), "StrategyDisable", template, clone); } catch { }
                             try { SetP(template, "IsEnabled", false); } catch { }
                             try { InvokeM(col, "Remove", template); } catch { }
-                            stopped.Add(new { strategy = clone.GetType().Name, account = a.Name, positionAtStop = posBefore });
+                            // Auto-flatten THIS strategy's own position with an offsetting market
+                            // order (strategy-sized, so it won't zero another strategy's net).
+                            string flattenResult = "none";
+                            if (flatten && instr != null && posQty > 0 && (posBefore == "Long" || posBefore == "Short"))
+                            {
+                                try
+                                {
+                                    var act = posBefore == "Long" ? OrderAction.Sell : OrderAction.Buy;
+                                    var o = a.CreateOrder(instr, act, OrderType.Market, TimeInForce.Day, posQty, 0, 0, string.Empty, "McpFlatten", null);
+                                    a.Submit(new[] { o });
+                                    flattenResult = act + " " + posQty + " market";
+                                }
+                                catch (Exception fex) { flattenResult = "FAILED: " + fex.Message; }
+                            }
+                            stopped.Add(new { strategy = clone.GetType().Name, account = a.Name, positionAtStop = posBefore, flatten = flattenResult });
                         }
                     }
                 }
@@ -1239,13 +1257,15 @@ namespace NinjaTrader.NinjaScript.AddOns
             }));
             if (err != null) return new { error = "stop failed: " + err.Message, stack = err.StackTrace };
             return new { stoppedCount = stopped.Count, stopped,
-                         note = "disabled + removed from chart; any open position is NOT auto-flattened -- flatten via nt_place_order if needed" };
+                         note = "disabled + removed from chart; open positions auto-flattened via an offsetting market order when flatten=true (default)" };
         }
 
         // Locate the target chart's ChartControl + primary ChartBars for an instrument.
-        //   (a) reuse the ChartControl off any running strategy on a matching chart (reliable);
-        //   (b) else walk each Chart window (Globals.AllWindows) for a ChartControl whose
-        //       primary series matches (handles empty charts).
+        //   (a) reuse the ChartControl off any running strategy on a matching chart;
+        //   (b) else traverse each Chart window's MainTabControl -> TabItem.Content and
+        //       collect ChartControls (handles charts with no strategy yet). The Chart
+        //       window's own visual root is NOT walkable and ActiveChartControl throws, so
+        //       we descend from the realized tab content instead.
         private bool FindChartControl(string instrument, out object cc, out object cb)
         {
             cc = null; cb = null;
@@ -1258,32 +1278,57 @@ namespace NinjaTrader.NinjaScript.AddOns
                 {
                     if (s == null) continue;
                     var c = GetMember(s, "ChartControl");
-                    if (c == null) continue;
-                    var cInstr = GetMember(c, "Instrument") as Instrument;
-                    if (cInstr != null && (wantName == null || cInstr.FullName == wantName))
-                    { cc = c; cb = GetMember(s, "ChartBars"); if (cb != null) return true; }
+                    if (c == null || !InstrumentMatches(GetMember(c, "Instrument") as Instrument, wantName)) continue;
+                    cc = c; cb = GetMember(s, "ChartBars") ?? FirstBars(c);
+                    if (cb != null) return true;
                 }
 
-            // (b) via chart windows
+            // (b) via chart windows -> MainTabControl -> tab content
             var allWindows = GetStaticMember(typeof(NinjaTrader.Core.Globals), "AllWindows") as System.Collections.IEnumerable;
             if (allWindows != null)
                 foreach (var w in allWindows)
                 {
                     if (w == null || w.GetType().FullName != "NinjaTrader.Gui.Chart.Chart") continue;
+                    var items = GetMember(GetMember(w, "MainTabControl"), "Items") as System.Collections.IEnumerable;
+                    if (items == null) continue;
                     var ccList = new List<object>();
-                    if (w is System.Windows.DependencyObject dw) CollectChartControls(dw, ccList, new HashSet<object>(), 0);
+                    foreach (var tab in items)
+                    {
+                        var content = GetMember(tab, "Content");
+                        if (content == null) continue;
+                        if (content.GetType().FullName == "NinjaTrader.Gui.Chart.ChartControl") ccList.Add(content);
+                        if (content is System.Windows.DependencyObject dco) CollectChartControls(dco, ccList, new HashSet<object>(), 0);
+                    }
                     foreach (var c in ccList)
                     {
-                        var cInstr = GetMember(c, "Instrument") as Instrument;
-                        if (cInstr == null || (wantName != null && cInstr.FullName != wantName)) continue;
-                        // primary ChartBars = BarsArray[0]
-                        var barsArr = GetMember(c, "BarsArray") as System.Collections.IEnumerable;
-                        object first = null;
-                        if (barsArr != null) foreach (var b in barsArr) { first = b; break; }
+                        if (!InstrumentMatches(GetMember(c, "Instrument") as Instrument, wantName)) continue;
+                        var first = FirstBars(c);
                         if (first != null) { cc = c; cb = first; return true; }
                     }
                 }
             return false;
+        }
+
+        private static object FirstBars(object chartControl)
+        {
+            var barsArr = GetMember(chartControl, "BarsArray") as System.Collections.IEnumerable;
+            if (barsArr != null) foreach (var b in barsArr) return b;
+            return null;
+        }
+
+        // Match a chart's instrument to the requested one by FullName, else MasterInstrument
+        // name (so "MNQ 09-26" resolves regardless of the " Globex" suffix / exact expiry text).
+        private static bool InstrumentMatches(Instrument chartInstr, string wantFullName)
+        {
+            if (chartInstr == null) return false;
+            if (wantFullName == null) return true;
+            if (chartInstr.FullName == wantFullName) return true;
+            try
+            {
+                var wantMaster = wantFullName.Split(' ')[0];
+                return string.Equals(chartInstr.MasterInstrument?.Name, wantMaster, StringComparison.OrdinalIgnoreCase);
+            }
+            catch { return false; }
         }
 
         // Find a compiled NinjaScript strategy Type by class name across loaded assemblies.
