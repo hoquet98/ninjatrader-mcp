@@ -192,6 +192,10 @@ namespace NinjaTrader.NinjaScript.AddOns
                 case "/api/compile":            return Post(method, () => Compile(body));
                 case "/api/compile/result":     return ReadCompileResult();
                 case "/api/backtest":           return Post(method, () => Backtest(body));
+                case "/api/strategy/running":   return RunningStrategies();
+                case "/api/strategy/deploy":    return Post(method, () => DeployStrategy(body));
+                case "/api/strategy/stop":      return Post(method, () => StopStrategy(body));
+                case "/api/dev/stash-chart":    if (!DevMode) return new { error = "dev only" }; return StashChart();
                 case "/api/sa/close":           return Post(method, () => CloseSaWindows());
                 case "/api/sa/inspect":         if (!DevMode) return new { error = "dev only" }; return SaInspect();
 
@@ -1068,6 +1072,305 @@ namespace NinjaTrader.NinjaScript.AddOns
                     });
                 }
             return orders;
+        }
+
+        // Read-only inventory of the strategies NT8 currently runs on an account
+        // (Account.Strategies / ServerStrategies). Basis for nt_strategy_status.
+        private object RunningStrategies()
+        {
+            var accountStrategies = new List<object>();
+            foreach (Account a in Account.All)
+            {
+                AddStrats(accountStrategies, a.Strategies as System.Collections.IEnumerable, "account:" + a.Name);
+                AddStrats(accountStrategies, a.ServerStrategies as System.Collections.IEnumerable, "server:" + a.Name);
+            }
+            return new { count = accountStrategies.Count, accountStrategies };
+        }
+
+        private void AddStrats(List<object> outp, System.Collections.IEnumerable col, string src)
+        {
+            if (col == null) return;
+            foreach (var s in col) if (s != null) outp.Add(DescribeStrategy(s, src));
+        }
+
+        // DEV: register the live chart's ChartControl + primary ChartBars (grabbed off any
+        // running strategy, which holds direct refs) as reflection handles, so the apply/enable
+        // sequence can be iterated over /api/dev/reflect WITHOUT recompiling (each recompile
+        // resets running strategies). Bake the working sequence into /api/strategy/deploy after.
+        private object StashChart()
+        {
+            object cc = null, cb = null, s0 = null;
+            foreach (Account a in Account.All)
+                foreach (var s in a.Strategies)
+                {
+                    var c = GetMember(s, "ChartControl");
+                    if (c != null) { cc = c; cb = GetMember(s, "ChartBars"); s0 = s; break; }
+                }
+            if (cc == null) return new { error = "no running strategy with a ChartControl (enable one first)" };
+            string hcc = "h" + (++_handleSeq); _handles[hcc] = cc;
+            string hcb = "h" + (++_handleSeq); _handles[hcb] = cb;
+            string hs0 = "h" + (++_handleSeq); _handles[hs0] = s0;
+            string hst = null; var strategies = GetMember(cc, "Strategies");
+            if (strategies != null) { hst = "h" + (++_handleSeq); _handles[hst] = strategies; }
+            string ho = null; var owner = GetMember(cc, "OwnerChart");
+            if (owner != null) { ho = "h" + (++_handleSeq); _handles[ho] = owner; }
+            return new
+            {
+                chartControl = hcc, ccType = cc.GetType().FullName,
+                chartBars = hcb, cbType = cb?.GetType().FullName,
+                existingStrategy = hs0, s0Type = s0.GetType().FullName,
+                strategiesCollection = hst,
+                ownerChart = ho,
+            };
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        //  Deploy / stop a strategy on a chart (SIM-first). Validated sequence:
+        //    create instance (defaults auto-populate) -> set Account (+params) ->
+        //    ChartControl.ApplyStrategy(null, strat, chartBars, false, null) [adds, disabled] ->
+        //    ChartControl.StrategyEnable(template, chartBars, true, null) [enables -> Realtime].
+        //  Stop = static ChartControl.StrategyDisable(template, clone) + Strategies.Remove(template).
+        // ═══════════════════════════════════════════════════════════════
+        private object DeployStrategy(string body)
+        {
+            var req = string.IsNullOrWhiteSpace(body) ? new JObject() : JObject.Parse(body);
+            string stratName = req.Str("strategy");
+            string instrument = req.Str("instrument");
+            string accountName = req.Str("account");
+            if (string.IsNullOrEmpty(accountName)) accountName = "Sim101";
+            bool enable = req["enable"] == null || (bool)req["enable"];
+            bool confirmLive = req["confirmLive"] != null && (bool)req["confirmLive"];
+            var prms = req["params"] as JObject;
+            if (string.IsNullOrEmpty(stratName) || string.IsNullOrEmpty(instrument))
+                return new { error = "strategy and instrument are required" };
+
+            var account = Account.All.FirstOrDefault(a => a.Name == accountName);
+            if (account == null) return new { error = "account not found: " + accountName };
+            // SIM-first guard: refuse a non-sim account unless explicitly confirmed.
+            bool isSim = account.Name.StartsWith("Sim", StringComparison.OrdinalIgnoreCase)
+                         || account.Provider.ToString().IndexOf("imulat", StringComparison.OrdinalIgnoreCase) >= 0;
+            if (!isSim && !confirmLive)
+                return new { error = "refusing to deploy to LIVE account '" + account.Name + "' without confirmLive=true" };
+
+            var stratType = FindStrategyType(stratName);
+            if (stratType == null) return new { error = "strategy type not found (compiled?): " + stratName };
+
+            object result = null; Exception err = null;
+            var disp = System.Windows.Application.Current?.Dispatcher;
+            if (disp == null) return new { error = "no WPF dispatcher (NT8 UI down?)" };
+            disp.Invoke((Action)(() =>
+            {
+                try
+                {
+                    object cc, cb;
+                    if (!FindChartControl(instrument, out cc, out cb) || cc == null || cb == null)
+                    { result = new { error = "no open chart found for instrument '" + instrument + "' — open a chart for it first" }; return; }
+
+                    var strat = Activator.CreateInstance(stratType);   // ctor runs SetDefaults
+                    SetP(strat, "Account", account);
+                    var applied = new List<string>();
+                    if (prms != null)
+                        foreach (var p in prms.Properties())
+                            if (p.Value is JValue jv && jv.Value != null)
+                                try { SetP(strat, p.Name, jv.Value); applied.Add(p.Name); } catch { }
+
+                    var addedObj = InvokeM(cc, "ApplyStrategy", null, strat, cb, false, null);
+                    object live = addedObj ?? strat;
+                    string state = GetMember(live, "State")?.ToString();
+                    if (enable)
+                    {
+                        var enabled = InvokeM(cc, "StrategyEnable", live, cb, true, null);
+                        if (enabled != null) live = enabled;
+                        state = GetMember(live, "State")?.ToString();
+                    }
+                    result = new
+                    {
+                        deployed = true, strategy = stratName, account = account.Name, isSim,
+                        instrument = GetMember(cc, "Instrument")?.ToString(),
+                        enabled = enable, state, paramsApplied = applied,
+                    };
+                }
+                catch (Exception ex) { err = ex; }
+            }));
+            if (err != null) return new { error = "deploy failed: " + err.Message, stack = err.StackTrace };
+            return result;
+        }
+
+        private object StopStrategy(string body)
+        {
+            var req = string.IsNullOrWhiteSpace(body) ? new JObject() : JObject.Parse(body);
+            string stratName = req.Str("strategy");
+            string accountName = req.Str("account");
+            var stopped = new List<object>(); Exception err = null;
+            var disp = System.Windows.Application.Current?.Dispatcher;
+            if (disp == null) return new { error = "no WPF dispatcher (NT8 UI down?)" };
+            disp.Invoke((Action)(() =>
+            {
+                try
+                {
+                    foreach (Account a in Account.All)
+                    {
+                        if (!string.IsNullOrEmpty(accountName) && a.Name != accountName) continue;
+                        // snapshot running clones first (we mutate the collection)
+                        var clones = new List<object>();
+                        foreach (var s in a.Strategies)
+                            if (s != null && (string.IsNullOrEmpty(stratName) || s.GetType().Name == stratName)) clones.Add(s);
+                        foreach (var clone in clones)
+                        {
+                            var cc = GetMember(clone, "ChartControl");
+                            if (cc == null) continue;
+                            // the chart holds the TEMPLATE (same Id as the running clone)
+                            object template = null;
+                            var col = GetMember(cc, "Strategies") as System.Collections.IEnumerable;
+                            var cloneId = GetMember(clone, "Id");
+                            if (col != null)
+                                foreach (var tmpl in col)
+                                    if (tmpl != null && Equals(GetMember(tmpl, "Id"), cloneId)) { template = tmpl; break; }
+                            if (template == null) template = clone;
+                            var posBefore = GetMember(GetMember(clone, "Position"), "MarketPosition")?.ToString();
+                            try { InvokeStaticM(cc.GetType(), "StrategyDisable", template, clone); } catch { }
+                            try { SetP(template, "IsEnabled", false); } catch { }
+                            try { InvokeM(col, "Remove", template); } catch { }
+                            stopped.Add(new { strategy = clone.GetType().Name, account = a.Name, positionAtStop = posBefore });
+                        }
+                    }
+                }
+                catch (Exception ex) { err = ex; }
+            }));
+            if (err != null) return new { error = "stop failed: " + err.Message, stack = err.StackTrace };
+            return new { stoppedCount = stopped.Count, stopped,
+                         note = "disabled + removed from chart; any open position is NOT auto-flattened -- flatten via nt_place_order if needed" };
+        }
+
+        // Locate the target chart's ChartControl + primary ChartBars for an instrument.
+        //   (a) reuse the ChartControl off any running strategy on a matching chart (reliable);
+        //   (b) else walk each Chart window (Globals.AllWindows) for a ChartControl whose
+        //       primary series matches (handles empty charts).
+        private bool FindChartControl(string instrument, out object cc, out object cb)
+        {
+            cc = null; cb = null;
+            var want = Instrument.GetInstrument(instrument);
+            string wantName = want?.FullName;
+
+            // (a) via a running strategy
+            foreach (Account a in Account.All)
+                foreach (var s in a.Strategies)
+                {
+                    if (s == null) continue;
+                    var c = GetMember(s, "ChartControl");
+                    if (c == null) continue;
+                    var cInstr = GetMember(c, "Instrument") as Instrument;
+                    if (cInstr != null && (wantName == null || cInstr.FullName == wantName))
+                    { cc = c; cb = GetMember(s, "ChartBars"); if (cb != null) return true; }
+                }
+
+            // (b) via chart windows
+            var allWindows = GetStaticMember(typeof(NinjaTrader.Core.Globals), "AllWindows") as System.Collections.IEnumerable;
+            if (allWindows != null)
+                foreach (var w in allWindows)
+                {
+                    if (w == null || w.GetType().FullName != "NinjaTrader.Gui.Chart.Chart") continue;
+                    var ccList = new List<object>();
+                    if (w is System.Windows.DependencyObject dw) CollectChartControls(dw, ccList, new HashSet<object>(), 0);
+                    foreach (var c in ccList)
+                    {
+                        var cInstr = GetMember(c, "Instrument") as Instrument;
+                        if (cInstr == null || (wantName != null && cInstr.FullName != wantName)) continue;
+                        // primary ChartBars = BarsArray[0]
+                        var barsArr = GetMember(c, "BarsArray") as System.Collections.IEnumerable;
+                        object first = null;
+                        if (barsArr != null) foreach (var b in barsArr) { first = b; break; }
+                        if (first != null) { cc = c; cb = first; return true; }
+                    }
+                }
+            return false;
+        }
+
+        // Find a compiled NinjaScript strategy Type by class name across loaded assemblies.
+        private static Type FindStrategyType(string name)
+        {
+            string full = "NinjaTrader.NinjaScript.Strategies." + name;
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                Type t = null;
+                try { t = asm.GetType(full, false) ?? asm.GetType(name, false); } catch { }
+                if (t != null && !t.IsAbstract) return t;
+            }
+            return null;
+        }
+
+        private static object InvokeStaticM(Type t, string name, params object[] args)
+        {
+            for (var bt = t; bt != null; bt = bt.BaseType)
+            {
+                var m = bt.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.DeclaredOnly)
+                         .FirstOrDefault(x => x.Name == name && x.GetParameters().Length == (args?.Length ?? 0));
+                if (m != null) return m.Invoke(null, args);
+            }
+            return null;
+        }
+
+        private object DescribeStrategy(object s, string source)
+        {
+            var t = s.GetType();
+            var chain = new List<string>();
+            for (var b = t; b != null && b != typeof(object); b = b.BaseType) chain.Add(b.FullName);
+            object instr = GetMember(s, "Instrument");
+            object acct = GetMember(s, "Account");
+            object pos = GetMember(s, "Position");
+            return new
+            {
+                source,
+                type = t.FullName,
+                name = GetMember(s, "Name")?.ToString(),
+                state = GetMember(s, "State")?.ToString(),
+                isEnabled = GetMember(s, "IsEnabled")?.ToString(),
+                account = (acct as Account)?.Name ?? GetMember(acct, "Name")?.ToString(),
+                instrument = (instr as Instrument)?.FullName ?? instr?.ToString(),
+                barsPeriod = GetMember(s, "BarsPeriod")?.ToString(),
+                calculate = GetMember(s, "Calculate")?.ToString(),
+                marketPosition = GetMember(pos, "MarketPosition")?.ToString(),
+                quantity = GetMember(pos, "Quantity"),
+            };
+        }
+
+        // Reflectively read a property or field (public or non-public); StrategyBase
+        // exposes several members as protected so a direct cast isn't always enough.
+        private static object GetMember(object o, string name)
+        {
+            if (o == null) return null;
+            const BindingFlags BF = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.FlattenHierarchy;
+            var t = o.GetType();
+            var p = t.GetProperty(name, BF);
+            if (p != null) { try { return p.GetValue(o); } catch { return null; } }
+            var f = t.GetField(name, BF);
+            if (f != null) { try { return f.GetValue(o); } catch { return null; } }
+            return null;
+        }
+
+        // Walk a window's visual tree collecting ChartControl instances (ActiveChartControl
+        // is null unless the tab is focused, so we find them structurally instead).
+        private void CollectChartControls(System.Windows.DependencyObject node, List<object> found, HashSet<object> seen, int depth)
+        {
+            if (node == null || depth > 400 || seen.Contains(node)) return;
+            seen.Add(node);
+            if (node.GetType().FullName == "NinjaTrader.Gui.Chart.ChartControl") found.Add(node);
+            int n = 0;
+            try { n = System.Windows.Media.VisualTreeHelper.GetChildrenCount(node); } catch { }
+            for (int i = 0; i < n; i++)
+                CollectChartControls(System.Windows.Media.VisualTreeHelper.GetChild(node, i), found, seen, depth + 1);
+        }
+
+        // Reflectively read a static property/field (public or non-public) off a type.
+        private static object GetStaticMember(Type t, string name)
+        {
+            if (t == null) return null;
+            const BindingFlags BF = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.FlattenHierarchy;
+            var p = t.GetProperty(name, BF);
+            if (p != null) { try { return p.GetValue(null); } catch { return null; } }
+            var f = t.GetField(name, BF);
+            if (f != null) { try { return f.GetValue(null); } catch { return null; } }
+            return null;
         }
 
         private object PlaceOrder(string body)

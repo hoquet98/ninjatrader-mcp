@@ -138,20 +138,6 @@ const TOOLS = [
       required: ['name'],
     },
   },
-  {
-    name: 'nt_execute_strategy',
-    description: 'Launch a strategy on a chart (local)',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        strategyName: { type: 'string', description: 'Strategy name (class)' },
-        symbol:       { type: 'string', description: 'Ticker' },
-        chartPeriod:  { type: 'string', description: 'Chart period', default: 'Minute' },
-        chartPeriodValue: { type: 'number', description: 'Period value', default: 1 },
-      },
-      required: ['strategyName', 'symbol'],
-    },
-  },
 
   // ─── Phase 2: strategy authoring / compile / backtest ─────────────────
   {
@@ -206,6 +192,38 @@ const TOOLS = [
         timeoutSec:  { type: 'number', description: 'Server-side wait for the run to finish', default: 180 },
       },
       required: ['strategy', 'symbol'],
+    },
+  },
+  {
+    name: 'nt_strategy_status',
+    description: 'List strategies NT8 is currently running (enabled on an account): type, state (Realtime/Historical/etc.), account, instrument, timeframe, market position and quantity. Read-only.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'nt_deploy_strategy',
+    description: 'Deploy a compiled strategy onto an OPEN chart and enable it (SIM-first). Adds the strategy to the chart for the given instrument, sets the account (default Sim101) + optional params, and enables it (Realtime). A live (non-sim) account requires confirmLive:true. Requires a chart already open for that instrument.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        strategy:    { type: 'string', description: 'Compiled strategy class name (e.g. PathSignatureUnion)' },
+        instrument:  { type: 'string', description: 'Instrument of an OPEN chart to deploy onto (e.g. NQ 09-26)' },
+        account:     { type: 'string', description: 'Account name', default: 'Sim101' },
+        params:      { type: 'object', description: 'Strategy parameter overrides { name: value }' },
+        enable:      { type: 'boolean', description: 'Enable after adding', default: true },
+        confirmLive: { type: 'boolean', description: 'Required to deploy to a non-sim (live) account', default: false },
+      },
+      required: ['strategy', 'instrument'],
+    },
+  },
+  {
+    name: 'nt_stop_strategy',
+    description: 'Stop running strategies: disable and remove them from the chart. Filter by strategy class name and/or account (omit both to stop all). Does NOT auto-flatten an open position — use nt_place_order if you need to flatten.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        strategy: { type: 'string', description: 'Strategy class name to stop (omit = all)' },
+        account:  { type: 'string', description: 'Limit to this account (omit = all)' },
+      },
     },
   },
 ];
@@ -342,8 +360,18 @@ async function handleToolCall(name, args) {
       return res.data;
     }
 
-    case 'nt_execute_strategy': {
-      const res = await ntFetch('/api/strategy/start', 'POST', args);
+    case 'nt_strategy_status': {
+      const res = await ntFetch('/api/strategy/running', 'GET', null, 30000);
+      return res.data;
+    }
+
+    case 'nt_deploy_strategy': {
+      const res = await ntFetch('/api/strategy/deploy', 'POST', args, 40000);
+      return res.data;
+    }
+
+    case 'nt_stop_strategy': {
+      const res = await ntFetch('/api/strategy/stop', 'POST', args, 40000);
       return res.data;
     }
 

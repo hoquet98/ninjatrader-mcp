@@ -19,7 +19,11 @@ Through a single stdio interface, this MCP lets an AI agent:
 **Strategy Development**
 - Author full NinjaScript strategy source
 - Compile it in-process via NinjaTrader's own Roslyn compiler — hot-swapped, **no NT8 restart**
-- Launch a compiled strategy live on a chart
+
+**Live Deployment & Monitoring**
+- Deploy a compiled strategy onto a chart and enable it — **SIM-first** (live needs explicit confirm)
+- List running strategies with state, account, instrument, and position; stop (disable + remove)
+- Strategies can POST a per-fill **notification webhook** to an external "AI Gate" (TradingView-style)
 
 **Backtesting**
 - Run backtests through the Strategy Analyzer over a configurable **symbol, date range, timeframe, and parameters**
@@ -113,7 +117,6 @@ mcpServers:
 | `nt_quote` | Real-time quote (bid, ask, last, volume, daily high/low) |
 | `nt_bars` | Historical OHLCV bars (Minute, Day, Tick, Volume, Range) |
 | `nt_search` | Search instruments by name or symbol |
-| `nt_execute_strategy` | Launch a NinjaScript strategy on a chart |
 
 ### Phase 2 — strategy authoring, compile, backtest
 
@@ -163,6 +166,28 @@ Example `nt_backtest` — the same strategy over a specific symbol, date range, 
    with QA (density/rolls/spot-check) and a `nt8_data_gaps` registry that **records feed holes instead of
    cross-vendor patching them**. See [nt8_ingest/README.md](nt8_ingest/README.md).
 
+### Phase 4 — live deployment, monitoring, alerts
+
+| Tool | Description |
+|------|-------------|
+| `nt_deploy_strategy` | Add a compiled strategy to an **open chart** and enable it (**SIM-first**). Sets account (default `Sim101`) + `params`; a live account requires `confirmLive: true`. |
+| `nt_stop_strategy` | Disable + remove running strategies (filter by class name / account). Does **not** auto-flatten an open position. |
+| `nt_strategy_status` | List strategies NT8 is running on an account: state (Realtime/…), account, instrument, timeframe, position, quantity. |
+
+**Typical Phase 4 flow:** open a chart for the instrument → `nt_deploy_strategy` (add + enable on
+Sim101) → `nt_strategy_status` (watch state + position) → `nt_stop_strategy` (disable + remove).
+
+```jsonc
+{ "strategy": "PathSignatureUnion", "instrument": "NQ 09-26",
+  "account": "Sim101", "params": { "Qty": 1 }, "enable": true }
+```
+
+**Strategy alerts (AI-Gate webhook).** A strategy can also POST a **notification** to an external
+"AI Gate" on every fill (the TradingView-webhook pattern) — a lean, notify-only payload (`source=nt8`,
+`event`, `side`, `qty`, `price`, …) so a downstream relay does **not** cross-execute (NT8 already
+filled the trade). This lives inside the NinjaScript strategy (an `AlertUrl` input + fire-and-forget
+POST), independent of the MCP tools above.
+
 ## Configuration
 
 **MCP server** (`nt-mcp-server.js`, on the AI-client machine):
@@ -197,12 +222,14 @@ result is written to a durable file and `nt_compile` reads it back automatically
 - **Phase 3** — historical data extraction (CSV) **and** a single-vendor, provenance-tagged 1-minute
   Postgres archive (`nt8_ohlcv_bars`) covering all six instruments (CL/GC/SI/ES/NQ/RTY),
   2020→present (~19.6M rows), kept current by a scheduled daily incremental updater
+- **Phase 4** — live deployment (`nt_deploy_strategy`, SIM-first), monitoring (`nt_strategy_status`),
+  teardown (`nt_stop_strategy`), and per-fill AI-Gate alert webhooks inside the strategies
 
-**Still ahead (Phase 4):**
+**Still ahead:**
 - `nt_optimize` — parameter optimization via the Strategy Analyzer optimizer
 - `nt_chart_state` / `nt_indicator_values` — read chart state + live indicator values
-- `nt_deploy_strategy` — deploy, verify, and monitor a strategy in production
-- Full backtest → optimize → deploy → monitor pipeline
+- Auto-open a chart during deploy (today `nt_deploy_strategy` requires a chart already open for the
+  instrument); auto-flatten on stop
 - Data archive: the NT8-live-capture **lineage gate** — currently **DEFERRED**; it needs a genuine
   NT8/Tradovate live capture to diff against the historical re-pull (comparing to the legacy
   cross-vendor `ohlcv_bars` is not a valid substitute)
