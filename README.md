@@ -188,14 +188,24 @@ but triggered over HTTP with **no restart**. Backtests are run by driving a brid
 from the GUI). A successful compile briefly drops the HTTP connection as the AppDomain reloads; the
 result is written to a durable file and `nt_compile` reads it back automatically.
 
-## Roadmap (Phase 4)
+## Roadmap
 
+**Shipped:**
+- **Phase 1** — account management, live trading, quotes, historical bars, instrument search
+- **Phase 2** — strategy authoring, in-process hot-swap compile (no NT8 restart), Strategy Analyzer
+  backtesting with configurable symbol / date range / timeframe / parameters
+- **Phase 3** — historical data extraction (CSV) **and** a single-vendor, provenance-tagged 1-minute
+  Postgres archive (`nt8_ohlcv_bars`) covering all six instruments (CL/GC/SI/ES/NQ/RTY),
+  2020→present (~19.6M rows), kept current by a scheduled daily incremental updater
+
+**Still ahead (Phase 4):**
 - `nt_optimize` — parameter optimization via the Strategy Analyzer optimizer
 - `nt_chart_state` / `nt_indicator_values` — read chart state + live indicator values
 - `nt_deploy_strategy` — deploy, verify, and monitor a strategy in production
 - Full backtest → optimize → deploy → monitor pipeline
-- Data archive: all six instruments (CL/GC/SI/ES/NQ/RTY) loaded 2020→present (~19.6M rows);
-  remaining work is the NT8-live-capture lineage gate (currently DEFERRED)
+- Data archive: the NT8-live-capture **lineage gate** — currently **DEFERRED**; it needs a genuine
+  NT8/Tradovate live capture to diff against the historical re-pull (comparing to the legacy
+  cross-vendor `ohlcv_bars` is not a valid substitute)
 
 ## Requirements
 
