@@ -195,7 +195,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                 case "/api/strategy/running":   return RunningStrategies();
                 case "/api/strategy/deploy":    return Post(method, () => DeployStrategy(body));
                 case "/api/strategy/stop":      return Post(method, () => StopStrategy(body));
-                case "/api/dev/stash-chart":    if (!DevMode) return new { error = "dev only" }; return StashChart();
+                case "/api/strategy/param":     return Post(method, () => SetStrategyParam(body));
                 case "/api/sa/close":           return Post(method, () => CloseSaWindows());
                 case "/api/sa/inspect":         if (!DevMode) return new { error = "dev only" }; return SaInspect();
 
@@ -820,7 +820,15 @@ namespace NinjaTrader.NinjaScript.AddOns
                 var kind = op.Str("op");
                 _lastHandle = null;
                 try { var r = RunOp(kind, op); _batchHandles.Add(_lastHandle); results.Add(r); }
-                catch (Exception ex) { _batchHandles.Add(null); results.Add(new { op = kind, error = ex.Message, stack = ex.StackTrace }); return new { results }; }
+                catch (Exception ex)
+                {
+                    var inner = ex.InnerException;
+                    _batchHandles.Add(null);
+                    results.Add(new { op = kind, error = ex.Message,
+                        inner = inner?.Message, innerType = inner?.GetType().FullName,
+                        innerStack = inner?.StackTrace, stack = ex.StackTrace });
+                    return new { results };
+                }
             }
             return new { results };
         }
@@ -831,6 +839,22 @@ namespace NinjaTrader.NinjaScript.AddOns
         {
             switch (kind)
             {
+                case "findTypes":
+                {
+                    var pat = op.Str("pattern") ?? "";
+                    var asmFilter = op.Str("assembly");
+                    var matches = new List<string>();
+                    foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+                    {
+                        if (!string.IsNullOrEmpty(asmFilter) && !asm.GetName().Name.Equals(asmFilter, StringComparison.OrdinalIgnoreCase)) continue;
+                        Type[] types; try { types = asm.GetTypes(); } catch { continue; }
+                        foreach (var t in types)
+                            if (t.FullName != null && t.FullName.IndexOf(pat, StringComparison.OrdinalIgnoreCase) >= 0)
+                                matches.Add(t.FullName);
+                    }
+                    matches.Sort();
+                    return new { count = matches.Count, types = matches.Take(120).ToList() };
+                }
                 case "listMembers":
                 {
                     var t = ResolveType(op);
@@ -1093,37 +1117,6 @@ namespace NinjaTrader.NinjaScript.AddOns
             foreach (var s in col) if (s != null) outp.Add(DescribeStrategy(s, src));
         }
 
-        // DEV: register the live chart's ChartControl + primary ChartBars (grabbed off any
-        // running strategy, which holds direct refs) as reflection handles, so the apply/enable
-        // sequence can be iterated over /api/dev/reflect WITHOUT recompiling (each recompile
-        // resets running strategies). Bake the working sequence into /api/strategy/deploy after.
-        private object StashChart()
-        {
-            object cc = null, cb = null, s0 = null;
-            foreach (Account a in Account.All)
-                foreach (var s in a.Strategies)
-                {
-                    var c = GetMember(s, "ChartControl");
-                    if (c != null) { cc = c; cb = GetMember(s, "ChartBars"); s0 = s; break; }
-                }
-            if (cc == null) return new { error = "no running strategy with a ChartControl (enable one first)" };
-            string hcc = "h" + (++_handleSeq); _handles[hcc] = cc;
-            string hcb = "h" + (++_handleSeq); _handles[hcb] = cb;
-            string hs0 = "h" + (++_handleSeq); _handles[hs0] = s0;
-            string hst = null; var strategies = GetMember(cc, "Strategies");
-            if (strategies != null) { hst = "h" + (++_handleSeq); _handles[hst] = strategies; }
-            string ho = null; var owner = GetMember(cc, "OwnerChart");
-            if (owner != null) { ho = "h" + (++_handleSeq); _handles[ho] = owner; }
-            return new
-            {
-                chartControl = hcc, ccType = cc.GetType().FullName,
-                chartBars = hcb, cbType = cb?.GetType().FullName,
-                existingStrategy = hs0, s0Type = s0.GetType().FullName,
-                strategiesCollection = hst,
-                ownerChart = ho,
-            };
-        }
-
         // ═══════════════════════════════════════════════════════════════
         //  Deploy / stop a strategy on a chart (SIM-first). Validated sequence:
         //    create instance (defaults auto-populate) -> set Account (+params) ->
@@ -1260,12 +1253,52 @@ namespace NinjaTrader.NinjaScript.AddOns
                          note = "disabled + removed from chart; open positions auto-flattened via an offsetting market order when flatten=true (default)" };
         }
 
+        // Change inputs on a RUNNING strategy live (no restart): e.g. Qty (#2), or
+        // Allow long / Allow short to pause/resume trading (#1). Only affects inputs the
+        // strategy re-reads each bar; startup-only inputs need a disable/enable to take hold.
+        private object SetStrategyParam(string body)
+        {
+            var req = string.IsNullOrWhiteSpace(body) ? new JObject() : JObject.Parse(body);
+            string stratName = req.Str("strategy");
+            string accountName = req.Str("account");
+            var prms = req["params"] as JObject;
+            if (prms == null || !prms.Properties().Any())
+                return new { error = "params object required, e.g. { \"Qty\": 2 } or { \"AllowLong\": false, \"AllowShort\": false }" };
+
+            var updated = new List<object>();
+            foreach (Account a in Account.All)
+            {
+                if (!string.IsNullOrEmpty(accountName) && a.Name != accountName) continue;
+                foreach (var s in a.Strategies)
+                {
+                    if (s == null) continue;
+                    if (!string.IsNullOrEmpty(stratName) && s.GetType().Name != stratName) continue;
+                    var changes = new List<object>();
+                    foreach (var p in prms.Properties())
+                    {
+                        if (!(p.Value is JValue jv) || jv.Value == null) continue;
+                        object before = GetMember(s, p.Name);
+                        bool ok = false;
+                        try { SetP(s, p.Name, jv.Value); ok = true; } catch { }
+                        object after = GetMember(s, p.Name);
+                        changes.Add(new { name = p.Name, before = before?.ToString(), after = after?.ToString(), applied = ok });
+                    }
+                    updated.Add(new { strategy = s.GetType().Name, account = a.Name,
+                                      state = GetMember(s, "State")?.ToString(), changes });
+                }
+            }
+            if (updated.Count == 0)
+                return new { error = "no running strategy matched (strategy='" + stratName + "', account='" + accountName + "')" };
+            return new { updatedCount = updated.Count, updated,
+                         note = "applies to inputs the strategy reads each bar (Qty, AllowLong/AllowShort, etc.); startup-only inputs (instrument, session windows) need a disable/enable" };
+        }
+
         // Locate the target chart's ChartControl + primary ChartBars for an instrument.
         //   (a) reuse the ChartControl off any running strategy on a matching chart;
-        //   (b) else traverse each Chart window's MainTabControl -> TabItem.Content and
-        //       collect ChartControls (handles charts with no strategy yet). The Chart
-        //       window's own visual root is NOT walkable and ActiveChartControl throws, so
-        //       we descend from the realized tab content instead.
+        //   (b) else, for each Chart window, try ActiveChartControl (works for the active/
+        //       focused chart) and the MainTabControl tab content, matching by instrument.
+        //   GetMember swallows exceptions, so ActiveChartControl throwing on an unfocused
+        //   chart just yields null rather than failing the search.
         private bool FindChartControl(string instrument, out object cc, out object cb)
         {
             cc = null; cb = null;
@@ -1283,22 +1316,24 @@ namespace NinjaTrader.NinjaScript.AddOns
                     if (cb != null) return true;
                 }
 
-            // (b) via chart windows -> MainTabControl -> tab content
+            // (b) via chart windows
             var allWindows = GetStaticMember(typeof(NinjaTrader.Core.Globals), "AllWindows") as System.Collections.IEnumerable;
             if (allWindows != null)
                 foreach (var w in allWindows)
                 {
                     if (w == null || w.GetType().FullName != "NinjaTrader.Gui.Chart.Chart") continue;
-                    var items = GetMember(GetMember(w, "MainTabControl"), "Items") as System.Collections.IEnumerable;
-                    if (items == null) continue;
                     var ccList = new List<object>();
-                    foreach (var tab in items)
-                    {
-                        var content = GetMember(tab, "Content");
-                        if (content == null) continue;
-                        if (content.GetType().FullName == "NinjaTrader.Gui.Chart.ChartControl") ccList.Add(content);
-                        if (content is System.Windows.DependencyObject dco) CollectChartControls(dco, ccList, new HashSet<object>(), 0);
-                    }
+                    var active = GetMember(w, "ActiveChartControl");   // works for the focused chart
+                    if (active != null) ccList.Add(active);
+                    var items = GetMember(GetMember(w, "MainTabControl"), "Items") as System.Collections.IEnumerable;
+                    if (items != null)
+                        foreach (var tab in items)
+                        {
+                            var content = GetMember(tab, "Content");
+                            if (content == null) continue;
+                            if (content.GetType().FullName == "NinjaTrader.Gui.Chart.ChartControl") ccList.Add(content);
+                            if (content is System.Windows.DependencyObject dco) CollectChartControls(dco, ccList, new HashSet<object>(), 0);
+                        }
                     foreach (var c in ccList)
                     {
                         if (!InstrumentMatches(GetMember(c, "Instrument") as Instrument, wantName)) continue;

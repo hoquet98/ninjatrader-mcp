@@ -227,6 +227,19 @@ const TOOLS = [
       },
     },
   },
+  {
+    name: 'nt_set_strategy_param',
+    description: 'Change inputs on a RUNNING strategy live, with no restart. Examples: { "Qty": 2 } to resize; { "AllowLong": false, "AllowShort": false } to pause trading (it keeps calculating but opens nothing new — un-pause by setting them true). Only affects inputs the strategy re-reads each bar; startup-only inputs (instrument, account, session windows) need a disable/enable. Filter by strategy class name and/or account.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        strategy: { type: 'string', description: 'Strategy class name (omit = all running)' },
+        account:  { type: 'string', description: 'Limit to this account (omit = all)' },
+        params:   { type: 'object', description: 'Inputs to set, e.g. { "Qty": 2 } or { "AllowLong": false, "AllowShort": false }' },
+      },
+      required: ['params'],
+    },
+  },
 ];
 
 // ─── HTTP Client to NT8 AddOn ──────────────────────────────────────────
@@ -373,6 +386,11 @@ async function handleToolCall(name, args) {
 
     case 'nt_stop_strategy': {
       const res = await ntFetch('/api/strategy/stop', 'POST', args, 40000);
+      return res.data;
+    }
+
+    case 'nt_set_strategy_param': {
+      const res = await ntFetch('/api/strategy/param', 'POST', args, 20000);
       return res.data;
     }
 
