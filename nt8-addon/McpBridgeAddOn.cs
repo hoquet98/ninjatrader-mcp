@@ -90,6 +90,7 @@ namespace NinjaTrader.NinjaScript.AddOns
             _serverThread.Start();
 
             Log($"McpBridgeAddOn v{Version} started on {prefix}" + (DevMode ? " (DEV reflection RPC enabled)" : ""));
+            try { ResumeRecorder(); } catch (Exception ex) { Log("recorder resume failed: " + ex.Message); }
         }
 
         private void StopServer()
@@ -98,9 +99,176 @@ namespace NinjaTrader.NinjaScript.AddOns
             _running = false;
             // Do NOT close SA windows here — closing pops a blocking confirmation dialog, and on a
             // hot-swap the next addon instance adopts the existing window anyway (FindExistingSaWindow).
+            try { lock (_recLock) StopRecorderInternal(true); } catch { }
             _listener?.Stop();
             _listener?.Close();
             Log("McpBridgeAddOn stopped");
+        }
+
+        // ===============================================================
+        //  Tick recorder - trades + top-of-book (L1). Always-on job: config
+        //  persists to mcp_recorder.json and auto-resumes on every NT8 restart
+        //  (addon reload -> StartServer -> ResumeRecorder). One row per TRADE:
+        //  ms,seq,px,sz,bid,ask,bsz,asz,side,ct  -> daily CSV per instrument.
+        // ===============================================================
+        private static string RecorderConfigFile => Path.Combine(Globals.UserDataDir, "mcp_recorder.json");
+        private static readonly TimeZoneInfo CtZone = SafeCt();
+        private static TimeZoneInfo SafeCt() { try { return TimeZoneInfo.FindSystemTimeZoneById("Central Standard Time"); } catch { return TimeZoneInfo.Local; } }
+        private static readonly DateTime Epoch = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+
+        private readonly object _recLock = new object();
+        private bool _recording;
+        private string _recDir;
+        private List<RecSub> _recSubs = new List<RecSub>();
+        private Thread _recFlush;
+        private volatile bool _recFlushRun;
+        private DateTime _recStarted;
+
+        private class RecSub
+        {
+            public Instrument Instrument;
+            public string Contract;
+            public string Dir;
+            public double TickSize;
+            public bool Subscribed;
+            public int BidTk = int.MinValue, AskTk = int.MinValue;
+            public long BidSz, AskSz, Rows;
+            public int Seq;
+            public readonly StringBuilder Buf = new StringBuilder();
+            public NinjaTrader.Data.MarketData Md;
+            public EventHandler<MarketDataEventArgs> Handler;
+        }
+
+        private static int ToTicks(double price, double tick) => (int)Math.Round(price / tick, MidpointRounding.AwayFromZero);
+        private static long UtcMs(DateTime t)
+        {
+            try { var u = TimeZoneInfo.ConvertTimeToUtc(DateTime.SpecifyKind(t, DateTimeKind.Unspecified), CtZone); return (long)(u - Epoch).TotalMilliseconds; }
+            catch { return (long)(DateTime.UtcNow - Epoch).TotalMilliseconds; }
+        }
+
+        private void OnMarketDataRec(RecSub s, MarketDataEventArgs e)
+        {
+            try
+            {
+                var mt = e.MarketDataType;
+                if (mt == MarketDataType.Bid) { s.BidTk = ToTicks(e.Price, s.TickSize); s.BidSz = e.Volume; return; }
+                if (mt == MarketDataType.Ask) { s.AskTk = ToTicks(e.Price, s.TickSize); s.AskSz = e.Volume; return; }
+                if (mt != MarketDataType.Last) return;
+                int px = ToTicks(e.Price, s.TickSize);
+                long ms = UtcMs(e.Time);
+                int side = (s.AskTk != int.MinValue && px >= s.AskTk) ? 1 : (s.BidTk != int.MinValue && px <= s.BidTk) ? -1 : 0;
+                lock (s.Buf)
+                {
+                    s.Buf.Append(ms).Append(',').Append(s.Seq++).Append(',').Append(px).Append(',').Append(e.Volume).Append(',')
+                         .Append(s.BidTk == int.MinValue ? "" : s.BidTk.ToString()).Append(',')
+                         .Append(s.AskTk == int.MinValue ? "" : s.AskTk.ToString()).Append(',')
+                         .Append(s.BidSz).Append(',').Append(s.AskSz).Append(',').Append(side).Append(',').Append(s.Contract).Append('\n');
+                    s.Rows++;
+                }
+            }
+            catch { }
+        }
+
+        private void RecFlushLoop() { while (_recFlushRun) { try { Thread.Sleep(1000); RecFlush(); } catch { } } try { RecFlush(); } catch { } }
+
+        private void RecFlush()
+        {
+            List<RecSub> subs; lock (_recLock) subs = _recSubs.ToList();
+            string day = DateTime.UtcNow.ToString("yyyyMMdd");
+            foreach (var s in subs)
+            {
+                if (!s.Subscribed) { try { var c = GetP(s.Instrument, "MarketDataConnection"); if (c != null) { InvokeM(s.Instrument, "TrySubscribeMarketData", c); s.Subscribed = true; } } catch { } }
+                try { var md = s.Instrument.MarketData; if (md != null && !ReferenceEquals(md, s.Md)) { if (s.Md != null) { try { s.Md.Update -= s.Handler; } catch { } } md.Update += s.Handler; s.Md = md; } } catch { }
+                string chunk; lock (s.Buf) { if (s.Buf.Length == 0) continue; chunk = s.Buf.ToString(); s.Buf.Clear(); }
+                try
+                {
+                    string dir = Path.Combine(_recDir, s.Dir); Directory.CreateDirectory(dir);
+                    string path = Path.Combine(dir, "t_" + day + ".csv");
+                    bool header = !File.Exists(path);
+                    using (var w = new StreamWriter(path, true, new UTF8Encoding(false))) { if (header) w.Write("ms,seq,px,sz,bid,ask,bsz,asz,side,ct\n"); w.Write(chunk); }
+                }
+                catch { }
+            }
+        }
+
+        private object StartRecorder(List<string> contracts, string dir, bool persist)
+        {
+            lock (_recLock)
+            {
+                StopRecorderInternal(false);
+                _recDir = dir; _recSubs = new List<RecSub>();
+                var started = new List<string>();
+                foreach (var c in contracts)
+                {
+                    var inst = Instrument.GetInstrument(c);
+                    if (inst == null) continue;
+                    var s = new RecSub { Instrument = inst, Contract = c, Dir = c.Split(' ')[0].ToLower(), TickSize = inst.MasterInstrument.TickSize };
+                    s.Handler = (o, e) => OnMarketDataRec(s, e);
+                    try { var conn = GetP(inst, "MarketDataConnection"); if (conn != null) { InvokeM(inst, "TrySubscribeMarketData", conn); s.Subscribed = true; } } catch { }
+                    s.Md = inst.MarketData; if (s.Md != null) s.Md.Update += s.Handler;
+                    _recSubs.Add(s); started.Add(c);
+                }
+                _recording = _recSubs.Count > 0; _recStarted = DateTime.UtcNow;
+                if (_recording) { _recFlushRun = true; _recFlush = new Thread(RecFlushLoop) { IsBackground = true }; _recFlush.Start(); }
+                if (persist) SaveRecConfig(true, contracts, dir);
+                return new { recording = _recording, instruments = started, dir, note = "auto-resumes on NT8 restart" };
+            }
+        }
+
+        private void StopRecorderInternal(bool flush)
+        {
+            _recFlushRun = false;
+            foreach (var s in _recSubs) { try { if (s.Md != null) s.Md.Update -= s.Handler; } catch { } }
+            if (flush) { try { RecFlush(); } catch { } }
+            _recSubs = new List<RecSub>(); _recording = false;
+        }
+
+        private object StopRecorder() { lock (_recLock) { StopRecorderInternal(true); SaveRecConfig(false, null, _recDir); return new { recording = false, stopped = true }; } }
+
+        private object RecorderStatus()
+        {
+            lock (_recLock)
+            {
+                return new
+                {
+                    recording = _recording, dir = _recDir, startedUtc = _recStarted,
+                    instruments = _recSubs.Select(s => new { contract = s.Contract, rows = s.Rows, subscribed = s.Subscribed,
+                        bid = s.BidTk == int.MinValue ? (int?)null : s.BidTk, ask = s.AskTk == int.MinValue ? (int?)null : s.AskTk, bidSz = s.BidSz, askSz = s.AskSz }).ToList()
+                };
+            }
+        }
+
+        private void SaveRecConfig(bool enabled, List<string> contracts, string dir)
+        {
+            try
+            {
+                var cfg = new JObject(); cfg["enabled"] = enabled; cfg["dir"] = dir;
+                if (contracts != null) cfg["instruments"] = new JArray(contracts.ToArray());
+                else { try { var old = JObject.Parse(File.ReadAllText(RecorderConfigFile)); cfg["instruments"] = old["instruments"]; } catch { } }
+                File.WriteAllText(RecorderConfigFile, cfg.ToString());
+            }
+            catch { }
+        }
+
+        private void ResumeRecorder()
+        {
+            if (!File.Exists(RecorderConfigFile)) return;
+            var cfg = JObject.Parse(File.ReadAllText(RecorderConfigFile));
+            if (cfg["enabled"] == null || !(bool)cfg["enabled"]) return;
+            var contracts = cfg["instruments"]?.Select(t => t.ToString()).ToList() ?? new List<string>();
+            var dir = cfg["dir"]?.ToString();
+            if (contracts.Count == 0 || string.IsNullOrEmpty(dir)) return;
+            StartRecorder(contracts, dir, false);
+            Log("recorder resumed: " + string.Join(",", contracts) + " -> " + dir);
+        }
+
+        private object StartRecorderReq(string body)
+        {
+            var req = string.IsNullOrWhiteSpace(body) ? new JObject() : JObject.Parse(body);
+            var contracts = req["instruments"]?.Select(t => t.ToString()).ToList();
+            if (contracts == null || contracts.Count == 0) contracts = new List<string> { "NQ 12-26", "ES 12-26" };
+            var dir = req.Str("dir"); if (string.IsNullOrEmpty(dir)) dir = @"C:\Users\Administrator\tick_capture";
+            return StartRecorder(contracts, dir, true);
         }
 
         // Manual cleanup endpoint: report all open windows and close the SA ones.
@@ -196,6 +364,9 @@ namespace NinjaTrader.NinjaScript.AddOns
                 case "/api/strategy/deploy":    return Post(method, () => DeployStrategy(body));
                 case "/api/strategy/stop":      return Post(method, () => StopStrategy(body));
                 case "/api/strategy/param":     return Post(method, () => SetStrategyParam(body));
+                case "/api/record/start":       return Post(method, () => StartRecorderReq(body));
+                case "/api/record/stop":        return Post(method, () => StopRecorder());
+                case "/api/record/status":      return RecorderStatus();
                 case "/api/sa/close":           return Post(method, () => CloseSaWindows());
                 case "/api/sa/inspect":         if (!DevMode) return new { error = "dev only" }; return SaInspect();
 
@@ -1048,11 +1219,15 @@ namespace NinjaTrader.NinjaScript.AddOns
                     name = account.Name,
                     provider = account.Provider.ToString(),
                     denomination = account.Denomination.ToString(),
+                    accountStatus = account.AccountStatus.ToString(),
+                    liquidationState = account.LiquidationState.ToString(),
                     cashValue = AcctGet(account, AccountItem.CashValue),
                     netLiquidation = AcctGet(account, AccountItem.NetLiquidation),
                     realizedPnL = AcctGet(account, AccountItem.RealizedProfitLoss),
                     unrealizedPnL = AcctGet(account, AccountItem.UnrealizedProfitLoss),
                     buyingPower = AcctGet(account, AccountItem.BuyingPower),
+                    trailingMaxDrawdown = AcctGet(account, AccountItem.TrailingMaxDrawdown),
+                    dailyLossLimit = AcctGet(account, AccountItem.DailyLossLimit),
                 });
             return accounts;
         }
@@ -1627,9 +1802,10 @@ namespace NinjaTrader.NinjaScript.AddOns
                 using (var w = new StreamWriter(path, false))
                 {
                     w.WriteLine("time,open,high,low,close,volume");
+                    var tfmt = periodType == BarsPeriodType.Tick ? "yyyy-MM-ddTHH:mm:ss.fff" : "yyyy-MM-ddTHH:mm:ss";
                     for (int i = 0; i < bars.Count; i++)
                         w.WriteLine(string.Join(",",
-                            bars.GetTime(i).ToString("yyyy-MM-ddTHH:mm:ss"),
+                            bars.GetTime(i).ToString(tfmt),
                             bars.GetOpen(i).ToString(ci), bars.GetHigh(i).ToString(ci),
                             bars.GetLow(i).ToString(ci), bars.GetClose(i).ToString(ci),
                             bars.GetVolume(i).ToString(ci)));
